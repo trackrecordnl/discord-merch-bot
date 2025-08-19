@@ -1,0 +1,14 @@
+{
+  "name": "discord-merch-bot",
+  "version": "1.0.0",
+  "main": "index.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "node-fetch": "^3.3.2",
+    "dotenv": "^16.4.5"
+  }
+}

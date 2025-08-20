@@ -19,7 +19,7 @@ const CHANNELS = parseList(process.env.CHANNELS);
 const KEYWORDS = parseList(process.env.KEYWORDS || 'vinyl,lp,cd,compact disc,schallplatte');
 const CHECK_INTERVAL = Number(process.env.CHECK_INTERVAL || 60);
 const TZ = process.env.TIMEZONE || 'Europe/Amsterdam';
-const UA = process.env.HTTP_UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+const UA = process.env.HTTP_UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
 const FORCE_REFRESH_HOSTS = parseList(process.env.FORCE_REFRESH_HOSTS || '');
 
 if(!TOKEN) throw new Error('DISCORD_TOKEN ontbreekt');
@@ -73,30 +73,37 @@ function productHash(p){
   return arr.sort().join('|');
 }
 
-/* Fetch met robuuste fallback, incl locale sitemaps */
+/* Fetch, met meerdere fallbacks voor lastige shops zoals Taylor EU */
 async function fetchProducts(base){
   base = originOnly(base);
 
-  // 1, products.json
+  // 1) products.json
   try{
-    const r = await fetch(`${base}/products.json?limit=250`, { headers:{ 'user-agent': UA, 'accept': 'application/json' }});
+    const r = await fetch(`${base}/products.json?limit=250`, { headers:{ 'user-agent': UA, 'accept':'application/json' }});
     if(r.ok){
       const data = await r.json();
       if(Array.isArray(data.products) && data.products.length) return data.products;
     }
   }catch{}
 
-  // 2, sitemaps
-  const fromSitemap = await fetchProductsViaSitemap(base);
-  if (fromSitemap.length) return fromSitemap;
+  // 2) sitemaps
+  const viaSitemap = await fetchProductsViaSitemap(base);
+  if(viaSitemap.length) return viaSitemap;
 
-  // 3, locale sitemaps als extra poging
+  // 3) locale sitemaps snel proberen
   const locales = ['en-en','de-en','en-gb','en','de','fr-fr','fr'];
   for(const loc of locales){
     const alt = await fetchProductsViaSitemap(`${base}/${loc}`);
     if(alt.length) return alt;
   }
-  return [];
+
+  // 4) Shopify search suggest per keyword, daarna per handle product.js ophalen
+  const viaSearch = await fetchProductsViaSearch(base);
+  if(viaSearch.length) return viaSearch;
+
+  // 5) HTML fallback op collections/all
+  const viaCollections = await fetchProductsViaCollections(base, locales);
+  return viaCollections;
 }
 
 async function fetchProductsViaSitemap(base){
@@ -105,7 +112,6 @@ async function fetchProductsViaSitemap(base){
     if(!sm.ok) return [];
     const xml = await sm.text();
 
-    // Zoek expliciete product sitemaps
     const productMaps = Array.from(xml.matchAll(/<loc>([^<]+sitemap_products[^<]+)<\/loc>/g)).map(m=>m[1]);
     const handles = new Set();
 
@@ -123,32 +129,82 @@ async function fetchProductsViaSitemap(base){
     }
 
     if(productMaps.length){
-      // pak maximaal de eerste 2 voor performance
       for(const m of productMaps.slice(0,2)) await harvestMap(m);
     }else{
-      // Geen productMaps, probeer direct uit de hoofdsitemap alle product urls
       const direct = Array.from(xml.matchAll(/<loc>([^<]+)<\/loc>/g)).map(m=>m[1]).filter(u => /\/products\//.test(u));
       for(const u of direct){
         const mh = u.match(/\/products\/([^/?#]+)/);
         if(mh && mh[1]) handles.add(mh[1]);
       }
-      // Als zelfs dat niets geeft, probeer direct de standaard product sitemaps
       for(const guess of [`${base}/sitemap_products_1.xml`, `${base}/sitemap_products_2.xml`]){
         await harvestMap(guess);
       }
     }
 
-    const out = [];
-    for(const handle of handles){
-      try{
-        const pj = await fetch(`${base}/products/${handle}.js`, { headers:{ 'user-agent': UA, 'accept': 'application/json' }});
-        if(!pj.ok) continue;
-        const pjs = await pj.json();
-        out.push(normalizeProductJs(pjs));
-      }catch{}
-    }
-    return out;
+    return await fetchByHandles(base, Array.from(handles));
   }catch{ return []; }
+}
+
+async function fetchProductsViaSearch(base){
+  const handles = new Set();
+  for(const kw of KEYWORDS){
+    try{
+      const url = `${base}/search/suggest.json?q=${encodeURIComponent(kw)}&resources[type]=product&resources[limit]=40&resources[options][fields]=title,product_type,variants.title,tags`;
+      const r = await fetch(url, { headers:{ 'user-agent': UA, 'accept':'application/json' }});
+      if(!r.ok) continue;
+      const j = await r.json();
+      const prods = j?.resources?.results?.products || j?.resources?.results || j?.products || [];
+      for(const p of prods){
+        const link = p?.url || p?.handle || p?.url_handle;
+        if(!link) continue;
+        const m = String(link).match(/\/products\/([^/?#]+)/);
+        if(m && m[1]) handles.add(m[1]);
+        else if (typeof link === 'string' && !link.includes('/')) handles.add(link);
+      }
+    }catch{}
+  }
+  if(handles.size === 0) return [];
+  return await fetchByHandles(base, Array.from(handles));
+}
+
+async function fetchProductsViaCollections(base, locales){
+  const candidates = [`${base}/collections/all`, ...locales.map(l => `${base}/${l}/collections/all`)];
+  for(const u of candidates){
+    try{
+      const r = await fetch(u, { headers:{ 'user-agent': UA, 'accept':'text/html,*/*' }});
+      if(!r.ok) continue;
+      const html = await r.text();
+      const handles = extractHandlesFromHtml(html);
+      if(handles.length){
+        const products = await fetchByHandles(base, handles.slice(0, 60)); // safety limit
+        if(products.length) return products;
+      }
+    }catch{}
+  }
+  return [];
+}
+
+function extractHandlesFromHtml(html){
+  const set = new Set();
+  for(const m of html.matchAll(/href="([^"]*\/products\/[^"]+)"/g)){
+    const u = m[1];
+    const mh = u.match(/\/products\/([^/?#]+)/);
+    if(mh && mh[1]) set.add(mh[1]);
+  }
+  return Array.from(set);
+}
+
+async function fetchByHandles(base, handles){
+  const out = [];
+  for(const handle of handles){
+    try{
+      const pj = await fetch(`${base}/products/${handle}.js`, { headers:{ 'user-agent': UA, 'accept':'application/json' }});
+      if(!pj.ok) continue;
+      const pjs = await pj.json();
+      out.push(normalizeProductJs(pjs));
+    }catch{}
+  }
+  return out;
 }
 
 function normalizeProductJs(pjs){
@@ -225,14 +281,13 @@ async function handleShop(shop, channelId){
     const avail = productAvailable(p);
     const hash  = productHash(p);
 
-    // Eénmalig force refresh om oude berichten zonder thumbnail te fixen
+    // éénmalig thumbnails forceren voor oude posts zonder foto
     if (shouldForceRefresh && prev?.messageId && !prev?.forceRefreshed) {
       try{
         const msg = await channel.messages.fetch(prev.messageId);
         await msg.edit({ embeds:[buildEmbed(shop, p, 'refresh')], components: buildButtons(shop, p) });
       }catch{}
       setEntry(key, { forceRefreshed: true });
-      // niet returnen, daarna normale logica uitvoeren
     }
 
     if(!prev){

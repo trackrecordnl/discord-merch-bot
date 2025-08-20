@@ -44,6 +44,14 @@ function asPriceString(val){
   if(/^\d+$/.test(s)) return (parseInt(s,10)/100).toFixed(2);
   const n = Number(s); return Number.isNaN(n) ? s : n.toFixed(2);
 }
+function pickImageUrl(shop, p){
+  let u = p?.image?.src || (Array.isArray(p?.images) && p.images[0]?.src) || null;
+  if (!u) return null;
+  if (u.startsWith('//')) u = 'https:' + u;
+  if (u.startsWith('http://')) u = 'https://' + u.slice(7);
+  if (u.startsWith('/')) u = originOnly(shop) + u;
+  return u;
+}
 function textMatchesKeywords(...parts){
   const txt = parts.filter(Boolean).join(' ').toLowerCase();
   return KEYWORDS.some(k => txt.includes(k));
@@ -128,7 +136,8 @@ function buildEmbed(shop, p, note){
     .setURL(`${base}/products/${p.handle}`)
     .setColor(available ? 0x57F287 : 0xED4245)
     .addFields({ name:'Updated', value: nlDate(new Date()), inline: true });
-  if(p.image?.src) embed.setThumbnail(p.image.src);
+  const img = pickImageUrl(shop, p);
+  if(img) embed.setThumbnail(img);
   if(note) embed.addFields({ name:'Status', value: note, inline: true });
   return embed;
 }

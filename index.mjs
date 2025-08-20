@@ -45,5 +45,180 @@ function asPriceString(val){
 function textMatchesKeywords(...parts){ const txt = parts.filter(Boolean).join(' ').toLowerCase(); return KEYWORDS.some(k => txt.includes(k)); }
 function productWanted(p){
   const tags = Array.isArray(p?.tags) ? p.tags.join(' ') : String(p?.tags || '');
-  return textMatchesKeywords(p?.title, p?.product_type, tags
-                             
+  return textMatchesKeywords(p?.title, p?.product_type, tags);
+}
+function productAvailable(p){ return Array.isArray(p?.variants) && p.variants.some(v => v?.available); }
+function variantHash(v){ return `${v?.available?'1':'0'}|${asPriceString(v?.price)}`; } // bepaalt of er echt iets veranderd is
+function keyFor(shop, p, v){ return `${originOnly(shop)}|${p.id || p.handle}|${v.id}`; }
+
+// ===== fetching met fallback =====
+async function fetchProducts(base){
+  base = originOnly(base);
+  // products.json
+  try{
+    const r = await fetch(`${base}/products.json?limit=250`, { headers:{ 'user-agent':'MerchBot/3.4' }});
+    if(r.ok){
+      const data = await r.json();
+      if(Array.isArray(data.products) && data.products.length) return data.products;
+    }
+  }catch{}
+  // sitemap fallback
+  return await fetchProductsViaSitemap(base);
+}
+async function fetchProductsViaSitemap(base){
+  try{
+    const sm = await fetch(`${base}/sitemap.xml`, { headers:{ 'user-agent':'MerchBot/3.4' }});
+    if(!sm.ok) return [];
+    const xml = await sm.text();
+    const maps = Array.from(xml.matchAll(/<loc>([^<]+sitemap_products[^<]+)<\/loc>/g)).map(m=>m[1]).slice(0,2);
+    const urls = [];
+    for(const m of maps){
+      try{
+        const r = await fetch(m, { headers:{ 'user-agent':'MerchBot/3.4' }});
+        if(!r.ok) continue;
+        const x = await r.text();
+        urls.push(...Array.from(x.matchAll(/<loc>([^<]+\/products\/[^<]+)<\/loc>/g)).map(m=>m[1]));
+      }catch{}
+    }
+    const out = [];
+    for(const u of urls){
+      const mh = u.match(/\/products\/([^/?#]+)/); const handle = mh?mh[1]:null; if(!handle) continue;
+      try{
+        const pj = await fetch(`${base}/products/${handle}.js`, { headers:{ 'user-agent':'MerchBot/3.4' }});
+        if(!pj.ok) continue;
+        const pjs = await pj.json();
+        out.push(normalizeProductJs(pjs));
+      }catch{}
+    }
+    return out;
+  }catch{ return []; }
+}
+function normalizeProductJs(pjs){
+  const images = Array.isArray(pjs?.images)? pjs.images.map(src=>({src})) : pjs?.featured_image? [{src:pjs.featured_image}] : [];
+  const variants = Array.isArray(pjs?.variants)? pjs.variants.map(v=>({ id:v.id, title:v.title, price:asPriceString(v.price), available:!!v.available })) : [];
+  return {
+    id: pjs?.id ?? pjs?.product_id ?? String(pjs?.handle || Math.random()),
+    title: pjs?.title || 'Product',
+    handle: pjs?.handle,
+    images,
+    image: images[0] || null,
+    published_at: pjs?.published_at || null,
+    variants,
+    product_type: pjs?.type || pjs?.product_type || '',
+    tags: pjs?.tags || []
+  };
+}
+
+// ===== discord ui =====
+function buildEmbed(shop, p, note){
+  const base = originOnly(shop);
+  const available = productAvailable(p);
+  const title = available ? p.title : `~~${p.title}~~ (Sold Out)`;
+  const embed = new EmbedBuilder()
+    .setTitle(title)
+    .setURL(`${base}/products/${p.handle}`)
+    .setColor(available ? 0x57F287 : 0xED4245)
+    .addFields({ name:'Updated', value: nlDate(new Date()), inline:true });
+  if(p.image?.src) embed.setThumbnail(p.image.src);
+  if(note) embed.addFields({ name:'Status', value: note, inline:true });
+  return embed;
+}
+function buildButtons(shop, p){
+  const base = originOnly(shop);
+  // kies 1 variant om op te kopen, bij voorkeur een beschikbare
+  const v = (p.variants || []).find(x => x.available) || (p.variants || [])[0];
+  if(!v){
+    return [ new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setLabel('View Product').setStyle(ButtonStyle.Link).setURL(`${base}/products/${p.handle}`)
+    ) ];
+  }
+  return [ new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setLabel('Add to Cart').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:1`),
+    new ButtonBuilder().setLabel('Add to Cart (x2)').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:2`)
+  ) ];
+}
+
+// ===== loop =====
+async function runOnce(){
+  for(let i=0;i<SHOPS.length;i++){
+    try{ await handleShop(SHOPS[i], CHANNELS[i]); }
+    catch(e){ console.error('Fout voor', SHOPS[i], e.message); }
+  }
+}
+
+async function handleShop(shop, channelId){
+  const channel = await client.channels.fetch(channelId);
+  if(!channel) return;
+  const products = await fetchProducts(shop);
+
+  // oudste eerst voor natuurlijke tijdlijn
+  products.sort((a,b)=> new Date(a.published_at||0) - new Date(b.published_at||0));
+
+  for(const p of products){
+    if(!productWanted(p)) continue;
+
+    // loop over varianten, maar we beheren 1 bericht per variant
+    for(const v of (p.variants || [])){
+      const key = keyFor(shop, p, v);
+      const prev = getEntry(key);
+      const nowHash = variantHash(v);
+      const nowAvail = !!v.available;
+
+      // nog niet gezien
+      if(!prev){
+        if(nowAvail){
+          // nieuw en beschikbaar, post
+          const msg = await channel.send({ embeds:[buildEmbed(shop, p, 'nieuw')], components: buildButtons(shop, p) });
+          setEntry(key, { hash: nowHash, available: nowAvail, messageId: msg.id, price: asPriceString(v.price) });
+        }else{
+          // nieuw maar sold out, niets posten, alleen registreren
+          setEntry(key, { hash: nowHash, available: nowAvail, messageId: null, price: asPriceString(v.price) });
+        }
+        continue;
+      }
+
+      // geen echte wijziging, niets doen
+      if(prev.hash === nowHash) continue;
+
+      // wijziging, bepaal type
+      if(prev.available === false && nowAvail === true){
+        // restock, als er nog geen message was mag het een nieuwe zijn
+        if(prev.messageId){
+          try{
+            const msg = await channel.messages.fetch(prev.messageId);
+            await msg.edit({ embeds:[buildEmbed(shop, p, 'restock')], components: buildButtons(shop, p) });
+          }catch{
+            const msg = await channel.send({ embeds:[buildEmbed(shop, p, 'restock')], components: buildButtons(shop, p) });
+            setEntry(key, { messageId: msg.id });
+          }
+        }else{
+          const msg = await channel.send({ embeds:[buildEmbed(shop, p, 'restock')], components: buildButtons(shop, p) });
+          setEntry(key, { messageId: msg.id });
+        }
+        setEntry(key, { hash: nowHash, available: nowAvail, price: asPriceString(v.price) });
+        continue;
+      }
+
+      if(prev.available === true && nowAvail === false){
+        // sold out, dezelfde melding bijwerken naar doorgestreept
+        if(prev.messageId){
+          try{
+            const msg = await channel.messages.fetch(prev.messageId);
+            await msg.edit({ embeds:[buildEmbed(shop, p, 'sold out')], components: buildButtons(shop, { ...p, variants: [] }) });
+          }catch{}
+        }
+        setEntry(key, { hash: nowHash, available: nowAvail, price: asPriceString(v.price) });
+        continue;
+      }
+
+      // prijs of iets anders gewijzigd, netjes bijwerken
+      if(prev.messageId){
+        try{
+          const msg = await channel.messages.fetch(prev.messageId);
+          await msg.edit({ embeds:[buildEmbed(shop, p, prev.available ? 'update' : 'update')], components: buildButtons(shop, p) });
+        }catch{}
+      }
+      setEntry(key, { hash: nowHash, available: nowAvail, price: asPriceString(v.price) });
+    }
+  }
+}

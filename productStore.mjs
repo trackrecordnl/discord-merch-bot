@@ -1,17 +1,37 @@
-// Simple in-memory product store to keep track of stock status
-import fs from 'fs';
+// productStore.mjs
+import fs from "fs";
 
-const file = './data/products.json';
+const DATA_FILE = "./data/products.json";
 
-export function loadProducts() {
+// Huidige data inladen
+export function loadState() {
+  if (!fs.existsSync(DATA_FILE)) {
+    return {};
+  }
   try {
-    const data = fs.readFileSync(file, 'utf-8');
-    return JSON.parse(data);
+    const raw = fs.readFileSync(DATA_FILE, "utf-8");
+    return JSON.parse(raw);
   } catch (err) {
+    console.error("Kon products.json niet lezen:", err);
     return {};
   }
 }
 
-export function saveProducts(products) {
-  fs.writeFileSync(file, JSON.stringify(products, null, 2));
+// State opslaan
+export function saveState(state) {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2));
+  } catch (err) {
+    console.error("Kon products.json niet opslaan:", err);
+  }
+}
+
+// Entry ophalen
+export function getEntry(state, handle) {
+  return state[handle];
+}
+
+// Entry toevoegen of bijwerken
+export function setEntry(state, handle, entry) {
+  state[handle] = entry;
 }

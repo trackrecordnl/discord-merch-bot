@@ -19,6 +19,9 @@ const CHANNELS = parseList(process.env.CHANNELS);
 const KEYWORDS = parseList(process.env.KEYWORDS || 'vinyl,lp,cd,compact disc,schallplatte');
 const CHECK_INTERVAL = Number(process.env.CHECK_INTERVAL || 60);
 const TZ = process.env.TIMEZONE || 'Europe/Amsterdam';
+const UA = process.env.HTTP_UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+const FORCE_REFRESH_HOSTS = parseList(process.env.FORCE_REFRESH_HOSTS || '');
+
 if(!TOKEN) throw new Error('DISCORD_TOKEN ontbreekt');
 if(SHOPS.length === 0 || SHOPS.length !== CHANNELS.length) throw new Error('SHOPS en CHANNELS moeten bestaan en even lang zijn');
 
@@ -36,6 +39,9 @@ client.login(TOKEN);
 function originOnly(url){
   try{ const u = new URL(url); return `${u.protocol}//${u.hostname}`; }
   catch{ return url.replace(/^(https?:\/\/[^/]+).*/, '$1'); }
+}
+function hostOnly(url){
+  try{ return new URL(url).hostname; } catch { const m = url.match(/^https?:\/\/([^/]+)/); return m?m[1]:url; }
 }
 function nlDate(d){ return new Intl.DateTimeFormat('nl-NL',{ dateStyle:'long', timeStyle:'short', timeZone: TZ }).format(d); }
 function asPriceString(val){
@@ -67,39 +73,75 @@ function productHash(p){
   return arr.sort().join('|');
 }
 
-/* Fetch met fallback */
+/* Fetch met robuuste fallback, incl locale sitemaps */
 async function fetchProducts(base){
   base = originOnly(base);
+
+  // 1, products.json
   try{
-    const r = await fetch(`${base}/products.json?limit=250`, { headers:{ 'user-agent':'MerchBot/3.6' }});
+    const r = await fetch(`${base}/products.json?limit=250`, { headers:{ 'user-agent': UA, 'accept': 'application/json' }});
     if(r.ok){
       const data = await r.json();
       if(Array.isArray(data.products) && data.products.length) return data.products;
     }
   }catch{}
-  return await fetchProductsViaSitemap(base);
+
+  // 2, sitemaps
+  const fromSitemap = await fetchProductsViaSitemap(base);
+  if (fromSitemap.length) return fromSitemap;
+
+  // 3, locale sitemaps als extra poging
+  const locales = ['en-en','de-en','en-gb','en','de','fr-fr','fr'];
+  for(const loc of locales){
+    const alt = await fetchProductsViaSitemap(`${base}/${loc}`);
+    if(alt.length) return alt;
+  }
+  return [];
 }
+
 async function fetchProductsViaSitemap(base){
   try{
-    const sm = await fetch(`${base}/sitemap.xml`, { headers:{ 'user-agent':'MerchBot/3.6' }});
+    const sm = await fetch(`${base}/sitemap.xml`, { headers:{ 'user-agent': UA, 'accept': 'application/xml,text/xml,*/*' }});
     if(!sm.ok) return [];
     const xml = await sm.text();
-    const maps = Array.from(xml.matchAll(/<loc>([^<]+sitemap_products[^<]+)<\/loc>/g)).map(m=>m[1]).slice(0,2);
-    if(!maps.length) return [];
-    const urls = [];
-    for(const m of maps){
+
+    // Zoek expliciete product sitemaps
+    const productMaps = Array.from(xml.matchAll(/<loc>([^<]+sitemap_products[^<]+)<\/loc>/g)).map(m=>m[1]);
+    const handles = new Set();
+
+    async function harvestMap(mapUrl){
       try{
-        const r = await fetch(m, { headers:{ 'user-agent':'MerchBot/3.6' }});
-        if(!r.ok) continue;
+        const r = await fetch(mapUrl, { headers:{ 'user-agent': UA, 'accept': 'application/xml,text/xml,*/*' }});
+        if(!r.ok) return;
         const x = await r.text();
-        urls.push(...Array.from(x.matchAll(/<loc>([^<]+\/products\/[^<]+)<\/loc>/g)).map(m=>m[1]));
+        const urls = Array.from(x.matchAll(/<loc>([^<]+)<\/loc>/g)).map(m=>m[1]).filter(u => /\/products\//.test(u));
+        for(const u of urls){
+          const mh = u.match(/\/products\/([^/?#]+)/);
+          if(mh && mh[1]) handles.add(mh[1]);
+        }
       }catch{}
     }
+
+    if(productMaps.length){
+      // pak maximaal de eerste 2 voor performance
+      for(const m of productMaps.slice(0,2)) await harvestMap(m);
+    }else{
+      // Geen productMaps, probeer direct uit de hoofdsitemap alle product urls
+      const direct = Array.from(xml.matchAll(/<loc>([^<]+)<\/loc>/g)).map(m=>m[1]).filter(u => /\/products\//.test(u));
+      for(const u of direct){
+        const mh = u.match(/\/products\/([^/?#]+)/);
+        if(mh && mh[1]) handles.add(mh[1]);
+      }
+      // Als zelfs dat niets geeft, probeer direct de standaard product sitemaps
+      for(const guess of [`${base}/sitemap_products_1.xml`, `${base}/sitemap_products_2.xml`]){
+        await harvestMap(guess);
+      }
+    }
+
     const out = [];
-    for(const u of urls){
-      const mh = u.match(/\/products\/([^/?#]+)/); const handle = mh?mh[1]:null; if(!handle) continue;
+    for(const handle of handles){
       try{
-        const pj = await fetch(`${base}/products/${handle}.js`, { headers:{ 'user-agent':'MerchBot/3.6' }});
+        const pj = await fetch(`${base}/products/${handle}.js`, { headers:{ 'user-agent': UA, 'accept': 'application/json' }});
         if(!pj.ok) continue;
         const pjs = await pj.json();
         out.push(normalizeProductJs(pjs));
@@ -108,6 +150,7 @@ async function fetchProductsViaSitemap(base){
     return out;
   }catch{ return []; }
 }
+
 function normalizeProductJs(pjs){
   const images = Array.isArray(pjs?.images) ? pjs.images.map(src=>({src})) : (pjs?.featured_image ? [{src:pjs.featured_image}] : []);
   const variants = Array.isArray(pjs?.variants) ? pjs.variants.map(v=>({
@@ -136,6 +179,7 @@ function buildEmbed(shop, p, note){
     .setURL(`${base}/products/${p.handle}`)
     .setColor(available ? 0x57F287 : 0xED4245)
     .addFields({ name:'Updated', value: nlDate(new Date()), inline: true });
+
   const img = pickImageUrl(shop, p);
   if(img) embed.setThumbnail(img);
   if(note) embed.addFields({ name:'Status', value: note, inline: true });
@@ -162,6 +206,7 @@ async function runOnce(){
     catch(e){ console.error('Fout voor', SHOPS[i], e.message); }
   }
 }
+
 async function handleShop(shop, channelId){
   const channel = await client.channels.fetch(channelId);
   if(!channel) return;
@@ -169,13 +214,26 @@ async function handleShop(shop, channelId){
   const products = await fetchProducts(shop);
   products.sort((a,b)=> new Date(a.published_at||0) - new Date(b.published_at||0));
 
+  const host = hostOnly(shop);
+  const shouldForceRefresh = FORCE_REFRESH_HOSTS.includes(host);
+
   for(const p of products){
     if(!productWanted(p)) continue;
 
     const key   = productKey(shop, p);
-    const prev  = getEntry(key);            // { available, hash, messageId, lastPostAt }
+    const prev  = getEntry(key);            // { available, hash, messageId, lastPostAt, forceRefreshed }
     const avail = productAvailable(p);
     const hash  = productHash(p);
+
+    // Eénmalig force refresh om oude berichten zonder thumbnail te fixen
+    if (shouldForceRefresh && prev?.messageId && !prev?.forceRefreshed) {
+      try{
+        const msg = await channel.messages.fetch(prev.messageId);
+        await msg.edit({ embeds:[buildEmbed(shop, p, 'refresh')], components: buildButtons(shop, p) });
+      }catch{}
+      setEntry(key, { forceRefreshed: true });
+      // niet returnen, daarna normale logica uitvoeren
+    }
 
     if(!prev){
       if(avail){

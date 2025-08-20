@@ -1,37 +1,29 @@
 // productStore.mjs
-import fs from "fs";
+import fs from 'fs';
+import path from 'path';
 
-const DATA_FILE = "./data/products.json";
+const DATA_DIR = './data';
+const DATA_FILE = path.join(DATA_DIR, 'products.json');
 
-// Huidige data inladen
-export function loadState() {
-  if (!fs.existsSync(DATA_FILE)) {
-    return {};
-  }
-  try {
-    const raw = fs.readFileSync(DATA_FILE, "utf-8");
-    return JSON.parse(raw);
-  } catch (err) {
-    console.error("Kon products.json niet lezen:", err);
-    return {};
-  }
-}
+let MEM = null;
 
-// State opslaan
-export function saveState(state) {
-  try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2));
-  } catch (err) {
-    console.error("Kon products.json niet opslaan:", err);
+function ensureLoaded(){
+  if(MEM !== null) return;
+  try{
+    if(!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    if(!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, '{}');
+    MEM = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8') || '{}');
+  }catch{
+    MEM = {};
   }
 }
+function persist(){ try{ fs.writeFileSync(DATA_FILE, JSON.stringify(MEM, null, 2)); }catch{} }
 
-// Entry ophalen
-export function getEntry(state, handle) {
-  return state[handle];
-}
-
-// Entry toevoegen of bijwerken
-export function setEntry(state, handle, entry) {
-  state[handle] = entry;
+export function loadState(){ ensureLoaded(); }
+export function getEntry(key){ ensureLoaded(); return MEM[key]; }
+export function setEntry(key, patch){
+  ensureLoaded();
+  const cur = MEM[key] || {};
+  MEM[key] = { ...cur, ...patch };
+  persist();
 }

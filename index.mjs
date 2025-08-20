@@ -1,171 +1,206 @@
-import { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
-import fetch from "node-fetch";
-import dotenv from "dotenv";
-import { loadState, saveState, getEntry, setEntry } from "./productStore.mjs";
-import fs from "fs";
+import 'dotenv/config';
+import fetch from 'node-fetch';
+import { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
+import { loadState, saveState } from './productStore.mjs';
 
-dotenv.config();
-
-// ENV
 const TOKEN = process.env.DISCORD_TOKEN;
-const SHOPS = (process.env.SHOPS || "").split(",").map(s => s.trim()).filter(Boolean);
-const CHANNELS = (process.env.CHANNELS || "").split(",").map(s => s.trim()).filter(Boolean);
-const CURRENCY = process.env.CURRENCY || "EUR";
-const TZ = process.env.TIMEZONE || "Europe/Amsterdam";
-const CHECK_INTERVAL = Number(process.env.CHECK_INTERVAL || 60);
-const BACKFILL = String(process.env.BACKFILL || "false").toLowerCase() === "true";
-const KEYWORDS = (process.env.KEYWORDS || "vinyl,lp,cd,compact disc,schallplatte").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+const SHOPS = process.env.SHOPS.split(',');
+const CHANNELS = process.env.CHANNELS.split(',');
 
 if (!TOKEN) throw new Error("DISCORD_TOKEN ontbreekt");
-if (SHOPS.length === 0 || SHOPS.length !== CHANNELS.length) throw new Error("SHOPS en CHANNELS moeten aanwezig zijn en even lang.");
+if (SHOPS.length !== CHANNELS.length) throw new Error("Aantal SHOPS en CHANNELS komt niet overeen");
 
-// Discord client
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const state = loadState();
 
-// Helpers
-function nlDate(d){
-  return new Intl.DateTimeFormat("nl-NL",{ dateStyle:"long", timeStyle:"short", timeZone: TZ }).format(d);
-}
-function cartUrl(shop, variantId, qty){
-  return `${shop.replace(/\/$/,"")}/cart/${variantId}:${qty}`;
-}
-function statusColor(status){
-  if (status === "Op voorraad") return 0x57F287;
-  if (status === "Restock") return 0xF1C40F;
-  return 0xED4245;
-}
-function titleWithStatus(title, status){
-  if (status === "Sold Out") return `~~${title}~~ (Sold Out)`;
-  if (status === "Restock") return `${title} (Restock)`;
-  return title;
-}
-function textMatchesKeywords(...parts){
-  const txt = parts.filter(Boolean).join(" ").toLowerCase();
-  return KEYWORDS.some(k => txt.includes(k));
-}
-function isWantedProduct(product, variant){
-  const tags = Array.isArray(product?.tags) ? product.tags.join(" ") : String(product?.tags || "");
-  return textMatchesKeywords(product?.title, product?.product_type, tags, variant?.title);
-}
+client.once('ready', () => {
+  console.log(`Bot online als ${client.user.tag}`);
+  checkAll();
+  setInterval(checkAll, 60 * 1000); // elke minuut
+});
 
-function buildEmbed(shop, product, variant, status, note){
-  const img = product?.images?.[0]?.src || product?.image?.src || null;
-  const publishedAt = product?.published_at ? new Date(product.published_at) : null;
+async function checkAll() {
+  for (let i = 0; i < SHOPS.length; i++) {
+    const shop = SHOPS[i];
+    const channelId = CHANNELS[i];
+    try {
+      const products = await fetchProducts(shop);
 
-  const embed = new EmbedBuilder()
-    .setTitle(titleWithStatus(product.title, status))
-    .setURL(`${shop.replace(/\/$/,"")}/products/${product.handle}`)
-    .setColor(statusColor(status))
-    .addFields(
-      { name: "Type", value: String(variant.title || "nvt"), inline: true },
-      { name: "Status", value: note ? `${note}` : status, inline: true },
-      { name: "Price", value: `${variant.price} ${CURRENCY}`, inline: true },
-      { name: "Updated", value: nlDate(new Date()), inline: true },
-      ...(publishedAt ? [{ name: "Published", value: nlDate(publishedAt), inline: true }] : [])
-    )
-    .setFooter({ text: "Stay ahead and never miss a drop!" });
+      for (const product of products) {
+        if (!product.product_type) continue;
+        const type = product.product_type.toLowerCase();
+        if (!(type.includes("vinyl") || type.includes("cd"))) continue;
 
-  if (img) embed.setThumbnail(img);
-  return embed;
-}
+        const existing = state[product.id];
+        const available = product.variants.some(v => v.available);
 
-function buildButtons(shop, variant){
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setLabel("Add to Cart").setStyle(ButtonStyle.Link).setURL(cartUrl(shop, variant.id, 1)),
-    new ButtonBuilder().setLabel("Add to Cart (x2)").setStyle(ButtonStyle.Link).setURL(cartUrl(shop, variant.id, 2))
-  );
-}
-
-function keyFor(shop, p, v){ return `${shop}|${p.id}|${v.id}`; }
-
-async function fetchProducts(shop){
-  const url = `${shop.replace(/\/$/,"")}/products.json?limit=250`;
-  const res = await fetch(url, { headers: { "user-agent": "MerchBot/3.0" }});
-  if(!res.ok) throw new Error(`HTTP ${res.status} voor ${url}`);
-  const data = await res.json();
-  return Array.isArray(data.products) ? data.products : [];
-}
-
-async function postNew(channel, shop, p, v, status, key, note){
-  const embed = buildEmbed(shop, p, v, status, note);
-  const row = buildButtons(shop, v);
-  const msg = await channel.send({ embeds:[embed], components:[row] });
-  setEntry(key, { available: !!v.available, messageId: msg.id, price: v.price });
-}
-
-async function editExisting(channel, shop, p, v, status, key, note){
-  const st = getEntry(key);
-  if(!st?.messageId){ return postNew(channel, shop, p, v, status, key, note); }
-  try{
-    const msg = await channel.messages.fetch(st.messageId);
-    const embed = buildEmbed(shop, p, v, status, note);
-    const row = buildButtons(shop, v);
-    await msg.edit({ embeds:[embed], components:[row] });
-    setEntry(key, { available: !!v.available, messageId: st.messageId, price: v.price });
-  }catch{
-    await postNew(channel, shop, p, v, status, key, note);
-  }
-}
-
-async function handleShop(shop, channelId){
-  const channel = await client.channels.fetch(channelId);
-  const products = await fetchProducts(shop);
-
-  // Oudste eerst, dan voelt de tijdlijn logisch
-  products.sort((a,b) => new Date(a.published_at||0) - new Date(b.published_at||0));
-
-  for(const p of products){
-    const variants = Array.isArray(p.variants) ? p.variants : [];
-    for(const v of variants){
-      // Filter, alleen cd en vinyl gerelateerd
-      if (!isWantedProduct(p, v)) continue;
-
-      const key = keyFor(shop, p, v);
-      const prev = getEntry(key);
-      const nowAvail = !!v.available;
-
-      if(!prev){
-        const firstStatus = nowAvail ? "Op voorraad" : "Sold Out";
-        if (BACKFILL || nowAvail){
-          await postNew(channel, shop, p, v, firstStatus, key, nowAvail ? "nieuw" : "eerste indexering");
-        } else {
-          setEntry(key, { available: nowAvail, messageId: null, price: v.price });
+        if (!existing) {
+          // Nieuw product
+          await postProduct(shop, channelId, product);
+          state[product.id] = { available, messageId: null };
+        } else if (existing.available !== available) {
+          // Restock of uitverkocht
+          await updateProduct(shop, channelId, product, existing.messageId);
+          state[product.id].available = available;
         }
-        continue;
       }
-
-      // Alleen reageren op echte wijzigingen
-      if (prev.available === false && nowAvail === true){
-        await editExisting(channel, shop, p, v, "Restock", key, "weer op voorraad");
-      } else if (prev.available === true && nowAvail === false){
-        await editExisting(channel, shop, p, v, "Sold Out", key, "net uitverkocht");
-      } else if (String(prev.price) !== String(v.price)){
-        await editExisting(channel, shop, p, v, prev.available ? "Op voorraad" : "Sold Out", key, "prijs aangepast");
-      }
-
-      // State bijwerken
-      setEntry(key, { available: nowAvail, messageId: getEntry(key)?.messageId || null, price: v.price });
+      saveState(state);
+    } catch (err) {
+      console.error(`Fout bij ${shop}:`, err.message);
     }
   }
 }
 
-async function runOnce(){
-  for(let i=0;i<SHOPS.length;i++){
-    try{ await handleShop(SHOPS[i], CHANNELS[i]); }
-    catch(e){ console.error("Fout voor", SHOPS[i], e.message); }
+async function fetchProducts(shop) {
+  const base = originOnly(shop);
+
+  // 1. Probeer products.json
+  try {
+    const url = `${base}/products.json?limit=250`;
+    const res = await fetch(url, { headers: { "user-agent": "MerchBot/3.2" }});
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data.products) && data.products.length > 0) {
+        return data.products;
+      }
+    }
+  } catch { /* fallback */ }
+
+  // 2. Fallback via sitemap + product.js
+  return await fetchProductsViaSitemap(base);
+}
+
+async function fetchProductsViaSitemap(base) {
+  const sm = await fetch(`${base}/sitemap.xml`, { headers: { "user-agent": "MerchBot/3.2" }});
+  if (!sm.ok) return [];
+  const xml = await sm.text();
+
+  const productMaps = Array.from(xml.matchAll(/<loc>([^<]+sitemap_products[^<]+)<\/loc>/g)).map(m => m[1]);
+  if (productMaps.length === 0) return [];
+
+  const take = productMaps.slice(0, 2);
+
+  const productUrls = [];
+  for (const mapUrl of take) {
+    try {
+      const r = await fetch(mapUrl, { headers: { "user-agent": "MerchBot/3.2" }});
+      if (!r.ok) continue;
+      const x = await r.text();
+      const urls = Array.from(x.matchAll(/<loc>([^<]+)<\/loc>/g))
+        .map(m => m[1])
+        .filter(u => /\/products\//.test(u));
+      productUrls.push(...urls);
+    } catch { /* volgende */ }
+  }
+
+  const out = [];
+  for (const url of productUrls) {
+    const handle = handleFromProductUrl(url);
+    if (!handle) continue;
+    try {
+      const pj = await fetch(`${base}/products/${handle}.js`, { headers: { "user-agent": "MerchBot/3.2" }});
+      if (!pj.ok) continue;
+      const product = await pj.json();
+      out.push(normalizeProductJsToProductsJson(product));
+    } catch { /* negeer */ }
+  }
+  return out;
+}
+
+function handleFromProductUrl(u) {
+  const m = u.match(/\/products\/([^/?#]+)/);
+  return m ? m[1] : null;
+}
+
+function normalizeProductJsToProductsJson(pjs) {
+  const images = Array.isArray(pjs?.images) ? pjs.images.map(src => ({ src })) : (pjs?.featured_image ? [{ src: pjs.featured_image }] : []);
+  const variants = Array.isArray(pjs?.variants) ? pjs.variants.map(v => ({
+    id: v.id,
+    title: v.title,
+    price: asPriceString(v.price),
+    available: !!v.available
+  })) : [];
+
+  return {
+    id: pjs?.id ?? pjs?.product_id ?? String(pjs?.handle || Math.random()),
+    title: pjs?.title || "Product",
+    handle: pjs?.handle,
+    images,
+    image: images[0] || null,
+    published_at: pjs?.published_at || null,
+    variants,
+    product_type: pjs?.type || pjs?.product_type || "",
+    tags: pjs?.tags || []
+  };
+}
+
+function asPriceString(val) {
+  if (val == null) return "";
+  const s = String(val);
+  if (/^\d+$/.test(s)) {
+    const cents = parseInt(s, 10);
+    return (cents / 100).toFixed(2);
+  }
+  const n = Number(s);
+  if (!Number.isNaN(n)) {
+    return n.toFixed(2);
+  }
+  return s;
+}
+
+function originOnly(url) {
+  const u = new URL(url);
+  return `${u.protocol}//${u.hostname}`;
+}
+
+async function postProduct(shop, channelId, product) {
+  const channel = await client.channels.fetch(channelId);
+  if (!channel) return;
+
+  const embed = buildEmbed(shop, product);
+  const row = buildButtons(shop, product);
+
+  const msg = await channel.send({ embeds: [embed], components: [row] });
+  state[product.id] = { available: product.variants.some(v => v.available), messageId: msg.id };
+  saveState(state);
+}
+
+async function updateProduct(shop, channelId, product, messageId) {
+  const channel = await client.channels.fetch(channelId);
+  if (!channel) return;
+  try {
+    const msg = await channel.messages.fetch(messageId);
+    const embed = buildEmbed(shop, product);
+    const row = buildButtons(shop, product);
+    await msg.edit({ embeds: [embed], components: [row] });
+  } catch (err) {
+    console.error("Update mislukt:", err.message);
   }
 }
 
-client.once("ready", async () => {
-  console.log(`Bot online als ${client.user.tag}`);
-  // Backfill 1 keer, zet daarna een vlag zodat het niet blijft spammen
-  const flag = "./.backfill_done";
-  const doBackfill = BACKFILL && !fs.existsSync(flag);
-  if (doBackfill) console.log("Backfill actief, eerste ronde posten...");
-  loadState(); // laad cache uit disk
-  await runOnce();
-  if (doBackfill) fs.writeFileSync(flag, String(Date.now()));
-  setInterval(runOnce, CHECK_INTERVAL * 1000);
-});
+function buildEmbed(shop, product) {
+  const embed = new EmbedBuilder()
+    .setTitle(product.title)
+    .setURL(`${originOnly(shop)}/products/${product.handle}`)
+    .setDescription(product.variants.map(v => `${v.title} - €${v.price} - ${v.available ? "🟢 In stock" : "🔴 Sold out"}`).join("\n"))
+    .setColor(product.variants.some(v => v.available) ? 0x00ff00 : 0xff0000);
+
+  if (product.image) {
+    embed.setThumbnail(product.image.src);
+  }
+  return embed;
+}
+
+function buildButtons(shop, product) {
+  const row = new ActionRowBuilder();
+  for (const v of product.variants.slice(0, 3)) {
+    const btn = new ButtonBuilder()
+      .setLabel(`${v.title} (€${v.price})`)
+      .setStyle(ButtonStyle.Link)
+      .setURL(`${originOnly(shop)}/cart/${v.id}:1`);
+    row.addComponents(btn);
+  }
+  return row;
+}
 
 client.login(TOKEN);

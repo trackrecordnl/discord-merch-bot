@@ -31,17 +31,18 @@ async function checkAll() {
         const type = product.product_type.toLowerCase();
         if (!(type.includes("vinyl") || type.includes("cd"))) continue;
 
-        const existing = state[product.id];
         const available = product.variants.some(v => v.available);
+        const key = `${shop}-${product.id}`;
+        const existing = state[key];
 
         if (!existing) {
-          // Nieuw product
+          // Nieuw product → opslaan + posten
           await postProduct(shop, channelId, product);
-          state[product.id] = { available, messageId: null };
+          state[key] = { available, messageId: null };
         } else if (existing.available !== available) {
-          // Restock of uitverkocht
+          // Alleen updaten als voorraadstatus is veranderd
           await updateProduct(shop, channelId, product, existing.messageId);
-          state[product.id].available = available;
+          state[key].available = available;
         }
       }
       saveState(state);
@@ -79,8 +80,8 @@ async function fetchProductsViaSitemap(base) {
   if (productMaps.length === 0) return [];
 
   const take = productMaps.slice(0, 2);
-
   const productUrls = [];
+
   for (const mapUrl of take) {
     try {
       const r = await fetch(mapUrl, { headers: { "user-agent": "MerchBot/3.2" }});
@@ -161,7 +162,8 @@ async function postProduct(shop, channelId, product) {
   const row = buildButtons(shop, product);
 
   const msg = await channel.send({ embeds: [embed], components: [row] });
-  state[product.id] = { available: product.variants.some(v => v.available), messageId: msg.id };
+  const key = `${shop}-${product.id}`;
+  state[key] = { available: product.variants.some(v => v.available), messageId: msg.id };
   saveState(state);
 }
 

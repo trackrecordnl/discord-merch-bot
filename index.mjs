@@ -1,208 +1,175 @@
+// index.mjs
+
 import 'dotenv/config';
-import fetch from 'node-fetch';
-import { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
-import { loadState, saveState } from './productStore.mjs';
+import fetch from "node-fetch";
+import {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle
+} from "discord.js";
+
+import { loadState, saveState } from "./productStore.mjs";
 
 const TOKEN = process.env.DISCORD_TOKEN;
-const SHOPS = process.env.SHOPS.split(',');
-const CHANNELS = process.env.CHANNELS.split(',');
-
 if (!TOKEN) throw new Error("DISCORD_TOKEN ontbreekt");
-if (SHOPS.length !== CHANNELS.length) throw new Error("Aantal SHOPS en CHANNELS komt niet overeen");
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-const state = loadState();
+const CHANNELS = JSON.parse(process.env.CHANNELS || "{}");
+const KEYWORDS = (process.env.KEYWORDS || "vinyl,cd").split(",");
 
-client.once('ready', () => {
-  console.log(`Bot online als ${client.user.tag}`);
-  checkAll();
-  setInterval(checkAll, 60 * 1000); // elke minuut
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 });
 
-async function checkAll() {
-  for (let i = 0; i < SHOPS.length; i++) {
-    const shop = SHOPS[i];
-    const channelId = CHANNELS[i];
+const state = loadState();
+
+client.once("ready", () => {
+  console.log(`✅ Bot online als ${client.user.tag}`);
+  checkAllStores();
+  setInterval(checkAllStores, 60 * 1000); // elke minuut
+});
+
+async function checkAllStores() {
+  for (const [store, channelId] of Object.entries(CHANNELS)) {
     try {
-      const products = await fetchProducts(shop);
+      await checkStore(store, channelId);
+    } catch (e) {
+      console.error("Fout bij checken", store, e);
+    }
+  }
+}
 
-      for (const product of products) {
-        if (!product.product_type) continue;
-        const type = product.product_type.toLowerCase();
-        if (!(type.includes("vinyl") || type.includes("cd"))) continue;
+async function checkStore(shop, channelId) {
+  const url = `${shop}/sitemap_products_1.xml`;
+  const res = await fetch(url);
+  const text = await res.text();
 
-        const available = product.variants.some(v => v.available);
-        const key = `${shop}-${product.id}`;
-        const existing = state[key];
+  const urls = [...text.matchAll(/<loc>(.*?)<\/loc>/g)].map(m => m[1]);
 
-        if (!existing) {
-          // Nieuw product → opslaan + posten
-          await postProduct(shop, channelId, product);
-          state[key] = { available, messageId: null };
-        } else if (existing.available !== available) {
-          // Alleen updaten als voorraadstatus is veranderd
-          await updateProduct(shop, channelId, product, existing.messageId);
-          state[key].available = available;
-        }
-      }
+  for (const u of urls) {
+    const handle = u.split("/").pop();
+    const product = await fetchProduct(shop, handle);
+    if (!product) continue;
+    if (!matchesKeywords(product)) continue;
+
+    const prev = state[handle];
+
+    // Nieuw product
+    if (!prev) {
+      await postToDiscord(shop, product, channelId);
+      state[handle] = { available: product.available };
       saveState(state);
-    } catch (err) {
-      console.error(`Fout bij ${shop}:`, err.message);
+    }
+
+    // Restock
+    if (prev && !prev.available && product.available) {
+      await updateDiscord(shop, product, channelId);
+      state[handle].available = true;
+      saveState(state);
+    }
+
+    // Nog steeds sold out → geen nieuwe ping
+    if (prev && !product.available) {
+      state[handle].available = false;
+      saveState(state);
     }
   }
 }
 
-async function fetchProducts(shop) {
-  const base = originOnly(shop);
-
-  // 1. Probeer products.json
+async function fetchProduct(shop, handle) {
   try {
-    const url = `${base}/products.json?limit=250`;
-    const res = await fetch(url, { headers: { "user-agent": "MerchBot/3.2" }});
-    if (res.ok) {
-      const data = await res.json();
-      if (Array.isArray(data.products) && data.products.length > 0) {
-        return data.products;
-      }
-    }
-  } catch { /* fallback */ }
-
-  // 2. Fallback via sitemap + product.js
-  return await fetchProductsViaSitemap(base);
-}
-
-async function fetchProductsViaSitemap(base) {
-  const sm = await fetch(`${base}/sitemap.xml`, { headers: { "user-agent": "MerchBot/3.2" }});
-  if (!sm.ok) return [];
-  const xml = await sm.text();
-
-  const productMaps = Array.from(xml.matchAll(/<loc>([^<]+sitemap_products[^<]+)<\/loc>/g)).map(m => m[1]);
-  if (productMaps.length === 0) return [];
-
-  const take = productMaps.slice(0, 2);
-  const productUrls = [];
-
-  for (const mapUrl of take) {
-    try {
-      const r = await fetch(mapUrl, { headers: { "user-agent": "MerchBot/3.2" }});
-      if (!r.ok) continue;
-      const x = await r.text();
-      const urls = Array.from(x.matchAll(/<loc>([^<]+)<\/loc>/g))
-        .map(m => m[1])
-        .filter(u => /\/products\//.test(u));
-      productUrls.push(...urls);
-    } catch { /* volgende */ }
+    const res = await fetch(`${shop}/products/${handle}.json`);
+    const json = await res.json();
+    return json.product;
+  } catch {
+    return null;
   }
-
-  const out = [];
-  for (const url of productUrls) {
-    const handle = handleFromProductUrl(url);
-    if (!handle) continue;
-    try {
-      const pj = await fetch(`${base}/products/${handle}.js`, { headers: { "user-agent": "MerchBot/3.2" }});
-      if (!pj.ok) continue;
-      const product = await pj.json();
-      out.push(normalizeProductJsToProductsJson(product));
-    } catch { /* negeer */ }
-  }
-  return out;
 }
 
-function handleFromProductUrl(u) {
-  const m = u.match(/\/products\/([^/?#]+)/);
-  return m ? m[1] : null;
+function matchesKeywords(product) {
+  const t = product.title.toLowerCase();
+  return KEYWORDS.some(k => t.includes(k.toLowerCase()));
 }
 
-function normalizeProductJsToProductsJson(pjs) {
-  const images = Array.isArray(pjs?.images) ? pjs.images.map(src => ({ src })) : (pjs?.featured_image ? [{ src: pjs.featured_image }] : []);
-  const variants = Array.isArray(pjs?.variants) ? pjs.variants.map(v => ({
-    id: v.id,
-    title: v.title,
-    price: asPriceString(v.price),
-    available: !!v.available
-  })) : [];
-
-  return {
-    id: pjs?.id ?? pjs?.product_id ?? String(pjs?.handle || Math.random()),
-    title: pjs?.title || "Product",
-    handle: pjs?.handle,
-    images,
-    image: images[0] || null,
-    published_at: pjs?.published_at || null,
-    variants,
-    product_type: pjs?.type || pjs?.product_type || "",
-    tags: pjs?.tags || []
-  };
-}
-
-function asPriceString(val) {
-  if (val == null) return "";
-  const s = String(val);
-  if (/^\d+$/.test(s)) {
-    const cents = parseInt(s, 10);
-    return (cents / 100).toFixed(2);
-  }
-  const n = Number(s);
-  if (!Number.isNaN(n)) {
-    return n.toFixed(2);
-  }
-  return s;
-}
-
-function originOnly(url) {
-  const u = new URL(url);
-  return `${u.protocol}//${u.hostname}`;
-}
-
-async function postProduct(shop, channelId, product) {
-  const channel = await client.channels.fetch(channelId);
-  if (!channel) return;
-
+async function postToDiscord(shop, product, channelId) {
   const embed = buildEmbed(shop, product);
-  const row = buildButtons(shop, product);
+  const buttons = buildButtons(shop, product);
 
-  const msg = await channel.send({ embeds: [embed], components: [row] });
-  const key = `${shop}-${product.id}`;
-  state[key] = { available: product.variants.some(v => v.available), messageId: msg.id };
+  const channel = await client.channels.fetch(channelId);
+  const msg = await channel.send({ embeds: [embed], components: buttons });
+
+  // Bewaar message id zodat we kunnen updaten bij restock
+  state[product.handle] = {
+    available: product.available,
+    messageId: msg.id
+  };
   saveState(state);
 }
 
-async function updateProduct(shop, channelId, product, messageId) {
+async function updateDiscord(shop, product, channelId) {
+  const embed = buildEmbed(shop, product);
+  const buttons = buildButtons(shop, product);
+
   const channel = await client.channels.fetch(channelId);
-  if (!channel) return;
+  const prev = state[product.handle];
+  if (!prev?.messageId) return;
+
   try {
-    const msg = await channel.messages.fetch(messageId);
-    const embed = buildEmbed(shop, product);
-    const row = buildButtons(shop, product);
-    await msg.edit({ embeds: [embed], components: [row] });
-  } catch (err) {
-    console.error("Update mislukt:", err.message);
+    const msg = await channel.messages.fetch(prev.messageId);
+    await msg.edit({ embeds: [embed], components: buttons });
+  } catch (e) {
+    console.error("Kon bericht niet updaten:", e);
   }
 }
 
 function buildEmbed(shop, product) {
-  const embed = new EmbedBuilder()
-    .setTitle(product.title)
-    .setURL(`${originOnly(shop)}/products/${product.handle}`)
-    .setDescription(product.variants.map(v => `${v.title} - €${v.price} - ${v.available ? "🟢 In stock" : "🔴 Sold out"}`).join("\n"))
-    .setColor(product.variants.some(v => v.available) ? 0x00ff00 : 0xff0000);
+  const available = product.variants.some(v => v.available);
+  let title = product.title;
+  if (!available) title = `~~${product.title}~~ (SOLD OUT)`;
 
-  if (product.image) {
-    embed.setThumbnail(product.image.src);
-  }
-  return embed;
+  return new EmbedBuilder()
+    .setTitle(title)
+    .setURL(`${shop}/products/${product.handle}`)
+    .setDescription(product.body_html?.replace(/<[^>]+>/g, "") || "")
+    .setThumbnail(product.images?.[0]?.src || null)
+    .setColor(available ? 0x2ecc71 : 0xe74c3c)
+    .setFooter({ text: shop });
 }
 
 function buildButtons(shop, product) {
-  const row = new ActionRowBuilder();
-  for (const v of product.variants.slice(0, 3)) {
-    const btn = new ButtonBuilder()
-      .setLabel(`${v.title} (€${v.price})`)
-      .setStyle(ButtonStyle.Link)
-      .setURL(`${originOnly(shop)}/cart/${v.id}:1`);
-    row.addComponents(btn);
+  const rows = [];
+
+  for (const v of product.variants.slice(0, 2)) {
+    if (!v.available) continue;
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setLabel(`${v.title} (1x €${v.price})`)
+        .setStyle(ButtonStyle.Link)
+        .setURL(`${originOnly(shop)}/cart/${v.id}:1`),
+      new ButtonBuilder()
+        .setLabel(`${v.title} (2x €${v.price})`)
+        .setStyle(ButtonStyle.Link)
+        .setURL(`${originOnly(shop)}/cart/${v.id}:2`),
+      new ButtonBuilder()
+        .setLabel(`${v.title} (4x €${v.price})`)
+        .setStyle(ButtonStyle.Link)
+        .setURL(`${originOnly(shop)}/cart/${v.id}:4`)
+    );
+    rows.push(row);
   }
-  return row;
+  return rows;
+}
+
+function originOnly(url) {
+  try {
+    const u = new URL(url);
+    return `${u.protocol}//${u.hostname}`;
+  } catch {
+    return url;
+  }
 }
 
 client.login(TOKEN);

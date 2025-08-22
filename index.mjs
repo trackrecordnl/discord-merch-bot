@@ -86,19 +86,17 @@ function buildPasswordEmbed(shop, locked){
   const base = originOnly(shop);
   const title = locked ? '🔒 Password Protected' : '🔓 Password Removed';
   const color = locked ? 0xFEE75C : 0x57F287;
-  const e = new EmbedBuilder()
+  return new EmbedBuilder()
     .setTitle(title)
     .setURL(base)
     .setColor(color)
     .addFields({ name: locked ? 'Locked At' : 'Unlocked At', value: nlDate(new Date()), inline: true });
-  return e;
 }
 
-/* Fetch met meerdere fallbacks, incl Taylor-achtige winkels */
+/* Fetch met meerdere fallbacks (products.json → sitemaps → search → collections) */
 async function fetchProducts(base){
   base = originOnly(base);
 
-  // 1) products.json
   try{
     const r = await fetch(`${base}/products.json?limit=250`, { headers:{ 'user-agent': UA, 'accept':'application/json' }});
     if(r.ok){
@@ -107,22 +105,18 @@ async function fetchProducts(base){
     }
   }catch{}
 
-  // 2) sitemaps
   const viaSitemap = await fetchProductsViaSitemap(base);
   if(viaSitemap.length) return viaSitemap;
 
-  // 3) locale sitemaps proberen
   const locales = ['en-en','de-en','en-gb','en','de','fr-fr','fr'];
   for(const loc of locales){
     const alt = await fetchProductsViaSitemap(`${base}/${loc}`);
     if(alt.length) return alt;
   }
 
-  // 4) Shopify search suggest per keyword
   const viaSearch = await fetchProductsViaSearch(base);
   if(viaSearch.length) return viaSearch;
 
-  // 5) HTML fallback op collections/all
   const viaCollections = await fetchProductsViaCollections(base, locales);
   return viaCollections;
 }
@@ -270,9 +264,9 @@ function buildButtons(shop, p){
     ) ];
   }
   return [ new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setLabel('Add to Cart').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:1`),
-    new ButtonBuilder().setLabel('Add to Cart (x2)').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:2`),
-    new ButtonBuilder().setLabel('Add to Cart (x4)').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:4`)
+    new ButtonBuilder().setLabel('Cart 1x').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:1`),
+    new ButtonBuilder().setLabel('Cart 2x').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:2`),
+    new ButtonBuilder().setLabel('Cart 3x').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:3`)
   ) ];
 }
 
@@ -294,9 +288,7 @@ async function handleShop(shop, channelId){
   const nowPw = await isPasswordProtected(shop);
   if (nowPw !== wasPw) {
     const embed = buildPasswordEmbed(shop, nowPw);
-    try{
-      await channel.send({ embeds:[embed] });
-    }catch{}
+    try{ await channel.send({ embeds:[embed] }); }catch{}
     setEntry(pwKey, { protected: nowPw, lastAt: Date.now() });
   }
 
@@ -328,7 +320,6 @@ async function handleShop(shop, channelId){
         const msg = await channel.send({ embeds:[buildEmbed(shop, p, 'nieuw')], components: buildButtons(shop, p) });
         setEntry(key, { available:true, hash, messageId:msg.id, lastPostAt: Date.now() });
       }else{
-        // eerste keer sold out, niets posten maar wel registreren
         setEntry(key, { available:false, hash, messageId:null, lastPostAt: Date.now() });
       }
       continue;
@@ -337,7 +328,6 @@ async function handleShop(shop, channelId){
     if(prev.hash === hash) continue;  // geen echte wijziging
 
     if(prev.available === false && avail === true){
-      // restock, update of nieuwe post
       if(prev.messageId){
         try{
           const msg = await channel.messages.fetch(prev.messageId);
@@ -355,7 +345,6 @@ async function handleShop(shop, channelId){
     }
 
     if(prev.available === true && avail === false){
-      // sold out, titel strikethrough, knoppen blijven staan
       if(prev.messageId){
         try{
           const msg = await channel.messages.fetch(prev.messageId);
@@ -366,7 +355,6 @@ async function handleShop(shop, channelId){
       continue;
     }
 
-    // overige wijzigingen, bijvoorbeeld prijs
     if(prev.messageId){
       try{
         const msg = await channel.messages.fetch(prev.messageId);

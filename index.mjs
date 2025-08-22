@@ -93,7 +93,7 @@ function buildPasswordEmbed(shop, locked){
     .addFields({ name: locked ? 'Locked At' : 'Unlocked At', value: nlDate(new Date()), inline: true });
 }
 
-/* Fetch met meerdere fallbacks (products.json → sitemaps → search → collections) */
+/* Fetch met meerdere fallbacks */
 async function fetchProducts(base){
   base = originOnly(base);
 
@@ -266,7 +266,7 @@ function buildButtons(shop, p){
   return [ new ActionRowBuilder().addComponents(
     new ButtonBuilder().setLabel('Cart 1x').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:1`),
     new ButtonBuilder().setLabel('Cart 2x').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:2`),
-    new ButtonBuilder().setLabel('Cart 3x').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:3`)
+    new ButtonBuilder().setLabel('Cart 4x').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:4`)
   ) ];
 }
 

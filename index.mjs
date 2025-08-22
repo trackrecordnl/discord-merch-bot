@@ -328,23 +328,22 @@ async function handleShop(shop, channelId){
     if(prev.hash === hash) continue;  // geen echte wijziging
 
     if(prev.available === false && avail === true){
+      // RESTOCK: nieuwe post onderaan, oude post verwijderen, state bijwerken
+      const newMsg = await channel.send({ embeds:[buildEmbed(shop, p, 'restock')], components: buildButtons(shop, p) });
       if(prev.messageId){
         try{
-          const msg = await channel.messages.fetch(prev.messageId);
-          await msg.edit({ embeds:[buildEmbed(shop, p, 'restock')], components: buildButtons(shop, p) });
+          const oldMsg = await channel.messages.fetch(prev.messageId);
+          await oldMsg.delete();
         }catch{
-          const msg = await channel.send({ embeds:[buildEmbed(shop, p, 'restock')], components: buildButtons(shop, p) });
-          setEntry(key, { messageId: msg.id });
+          // als verwijderen niet lukt, negeren
         }
-      }else{
-        const msg = await channel.send({ embeds:[buildEmbed(shop, p, 'restock')], components: buildButtons(shop, p) });
-        setEntry(key, { messageId: msg.id });
       }
-      setEntry(key, { available:true, hash, lastPostAt: Date.now() });
+      setEntry(key, { available:true, hash, messageId:newMsg.id, lastPostAt: Date.now() });
       continue;
     }
 
     if(prev.available === true && avail === false){
+      // SOLD OUT: zelfde bericht houden, strikethrough en knoppen laten staan
       if(prev.messageId){
         try{
           const msg = await channel.messages.fetch(prev.messageId);
@@ -355,6 +354,7 @@ async function handleShop(shop, channelId){
       continue;
     }
 
+    // Overige wijzigingen, bijvoorbeeld prijs
     if(prev.messageId){
       try{
         const msg = await channel.messages.fetch(prev.messageId);

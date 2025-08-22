@@ -73,7 +73,28 @@ function productHash(p){
   return arr.sort().join('|');
 }
 
-/* Fetch, met meerdere fallbacks voor lastige shops zoals Taylor EU */
+/* Password Protected detectie */
+async function isPasswordProtected(base){
+  try{
+    const r = await fetch(`${originOnly(base)}/`, { headers:{ 'user-agent': UA, 'accept': 'text/html,*/*' }});
+    if(!r.ok) return false;
+    const html = await r.text();
+    return /template-password|<form[^>]+action="\/password"|name="password"/i.test(html);
+  }catch{ return false; }
+}
+function buildPasswordEmbed(shop, locked){
+  const base = originOnly(shop);
+  const title = locked ? '🔒 Password Protected' : '🔓 Password Removed';
+  const color = locked ? 0xFEE75C : 0x57F287;
+  const e = new EmbedBuilder()
+    .setTitle(title)
+    .setURL(base)
+    .setColor(color)
+    .addFields({ name: locked ? 'Locked At' : 'Unlocked At', value: nlDate(new Date()), inline: true });
+  return e;
+}
+
+/* Fetch met meerdere fallbacks, incl Taylor-achtige winkels */
 async function fetchProducts(base){
   base = originOnly(base);
 
@@ -90,14 +111,14 @@ async function fetchProducts(base){
   const viaSitemap = await fetchProductsViaSitemap(base);
   if(viaSitemap.length) return viaSitemap;
 
-  // 3) locale sitemaps snel proberen
+  // 3) locale sitemaps proberen
   const locales = ['en-en','de-en','en-gb','en','de','fr-fr','fr'];
   for(const loc of locales){
     const alt = await fetchProductsViaSitemap(`${base}/${loc}`);
     if(alt.length) return alt;
   }
 
-  // 4) Shopify search suggest per keyword, daarna per handle product.js ophalen
+  // 4) Shopify search suggest per keyword
   const viaSearch = await fetchProductsViaSearch(base);
   if(viaSearch.length) return viaSearch;
 
@@ -176,7 +197,7 @@ async function fetchProductsViaCollections(base, locales){
       const html = await r.text();
       const handles = extractHandlesFromHtml(html);
       if(handles.length){
-        const products = await fetchByHandles(base, handles.slice(0, 60)); // safety limit
+        const products = await fetchByHandles(base, handles.slice(0, 60));
         if(products.length) return products;
       }
     }catch{}
@@ -235,7 +256,6 @@ function buildEmbed(shop, p, note){
     .setURL(`${base}/products/${p.handle}`)
     .setColor(available ? 0x57F287 : 0xED4245)
     .addFields({ name:'Updated', value: nlDate(new Date()), inline: true });
-
   const img = pickImageUrl(shop, p);
   if(img) embed.setThumbnail(img);
   if(note) embed.addFields({ name:'Status', value: note, inline: true });
@@ -251,7 +271,8 @@ function buildButtons(shop, p){
   }
   return [ new ActionRowBuilder().addComponents(
     new ButtonBuilder().setLabel('Add to Cart').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:1`),
-    new ButtonBuilder().setLabel('Add to Cart (x2)').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:2`)
+    new ButtonBuilder().setLabel('Add to Cart (x2)').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:2`),
+    new ButtonBuilder().setLabel('Add to Cart (x4)').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:4`)
   ) ];
 }
 
@@ -266,6 +287,18 @@ async function runOnce(){
 async function handleShop(shop, channelId){
   const channel = await client.channels.fetch(channelId);
   if(!channel) return;
+
+  // Password Protected alert op verandering
+  const pwKey = `pw|${originOnly(shop)}`;
+  const wasPw = getEntry(pwKey)?.protected || false;
+  const nowPw = await isPasswordProtected(shop);
+  if (nowPw !== wasPw) {
+    const embed = buildPasswordEmbed(shop, nowPw);
+    try{
+      await channel.send({ embeds:[embed] });
+    }catch{}
+    setEntry(pwKey, { protected: nowPw, lastAt: Date.now() });
+  }
 
   const products = await fetchProducts(shop);
   products.sort((a,b)=> new Date(a.published_at||0) - new Date(b.published_at||0));
@@ -295,6 +328,7 @@ async function handleShop(shop, channelId){
         const msg = await channel.send({ embeds:[buildEmbed(shop, p, 'nieuw')], components: buildButtons(shop, p) });
         setEntry(key, { available:true, hash, messageId:msg.id, lastPostAt: Date.now() });
       }else{
+        // eerste keer sold out, niets posten maar wel registreren
         setEntry(key, { available:false, hash, messageId:null, lastPostAt: Date.now() });
       }
       continue;
@@ -303,6 +337,7 @@ async function handleShop(shop, channelId){
     if(prev.hash === hash) continue;  // geen echte wijziging
 
     if(prev.available === false && avail === true){
+      // restock, update of nieuwe post
       if(prev.messageId){
         try{
           const msg = await channel.messages.fetch(prev.messageId);
@@ -320,16 +355,18 @@ async function handleShop(shop, channelId){
     }
 
     if(prev.available === true && avail === false){
+      // sold out, titel strikethrough, knoppen blijven staan
       if(prev.messageId){
         try{
           const msg = await channel.messages.fetch(prev.messageId);
-          await msg.edit({ embeds:[buildEmbed(shop, p, 'sold out')], components: buildButtons(shop, { ...p, variants: [] }) });
+          await msg.edit({ embeds:[buildEmbed(shop, p, 'sold out')], components: buildButtons(shop, p) });
         }catch{}
       }
       setEntry(key, { available:false, hash, lastPostAt: Date.now() });
       continue;
     }
 
+    // overige wijzigingen, bijvoorbeeld prijs
     if(prev.messageId){
       try{
         const msg = await channel.messages.fetch(prev.messageId);

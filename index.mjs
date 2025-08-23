@@ -7,7 +7,8 @@ import {
   EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
-  ButtonStyle
+  ButtonStyle,
+  Events
 } from 'discord.js';
 import { loadState, getEntry, setEntry } from './productStore.mjs';
 
@@ -21,18 +22,24 @@ const CHECK_INTERVAL = Number(process.env.CHECK_INTERVAL || 60);
 const TZ = process.env.TIMEZONE || 'Europe/Amsterdam';
 const UA = process.env.HTTP_UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
 const FORCE_REFRESH_HOSTS = parseList(process.env.FORCE_REFRESH_HOSTS || '');
+const ALLOW_CART_X4_HOSTS = new Set(parseList(process.env.ALLOW_CART_X4_HOSTS || '').map(h => h.toLowerCase()));
+const ALLOW_CART_X4_CHANNELS = new Set(parseList(process.env.ALLOW_CART_X4_CHANNELS || ''));
 
 if(!TOKEN) throw new Error('DISCORD_TOKEN ontbreekt');
 if(SHOPS.length === 0 || SHOPS.length !== CHANNELS.length) throw new Error('SHOPS en CHANNELS moeten bestaan en even lang zijn');
 
 /* Discord */
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-client.once('ready', async () => {
-  console.log(`Bot online als ${client.user.tag}`);
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+});
+
+client.once(Events.ClientReady, async (clientReady) => {
+  console.log(`Bot online als ${clientReady.user.tag}`);
   loadState();
   await runOnce();
   setInterval(runOnce, CHECK_INTERVAL * 1000);
 });
+
 client.login(TOKEN);
 
 /* Helpers */
@@ -67,7 +74,8 @@ function productWanted(p){
   return textMatchesKeywords(p?.title, p?.product_type, tags);
 }
 function productAvailable(p){ return Array.isArray(p?.variants) && p.variants.some(v => v?.available); }
-function productKey(shop, p){ return `${originOnly(shop)}|${p.handle||p.id}`; }
+function legacyKey(shop, p){ return `${originOnly(shop)}|${p.handle||p.id}`; }
+function productKey(shop, p, channelId){ return `${originOnly(shop)}|${p.handle||p.id}|${channelId}`; }
 function productHash(p){
   const arr = (p.variants||[]).map(v => `${v.id}:${v.available?1:0}:${asPriceString(v.price)}`);
   return arr.sort().join('|');
@@ -255,19 +263,31 @@ function buildEmbed(shop, p, note){
   if(note) embed.addFields({ name:'Status', value: note, inline: true });
   return embed;
 }
-function buildButtons(shop, p){
+
+function buildButtons(shop, p, channelId){
   const base = originOnly(shop);
+  const host = hostOnly(shop).toLowerCase();
   const v = (p.variants||[]).find(x => x.available) || (p.variants||[])[0];
+
   if(!v){
     return [ new ActionRowBuilder().addComponents(
       new ButtonBuilder().setLabel('View Product').setStyle(ButtonStyle.Link).setURL(`${base}/products/${p.handle}`)
     ) ];
   }
-  return [ new ActionRowBuilder().addComponents(
+
+  const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setLabel('Cart 1x').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:1`),
-    new ButtonBuilder().setLabel('Cart 2x').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:2`),
-    new ButtonBuilder().setLabel('Cart 4x').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:4`)
-  ) ];
+    new ButtonBuilder().setLabel('Cart 2x').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:2`)
+  );
+
+  // 4x alleen in kanalen of hosts die jij toestaat
+  if (ALLOW_CART_X4_CHANNELS.has(String(channelId)) || ALLOW_CART_X4_HOSTS.has(host)) {
+    row.addComponents(
+      new ButtonBuilder().setLabel('Cart 4x').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:4`)
+    );
+  }
+
+  return [row];
 }
 
 /* Loop */
@@ -301,8 +321,19 @@ async function handleShop(shop, channelId){
   for(const p of products){
     if(!productWanted(p)) continue;
 
-    const key   = productKey(shop, p);
-    const prev  = getEntry(key);            // { available, hash, messageId, lastPostAt, forceRefreshed }
+    const key = productKey(shop, p, channelId);
+    let prev = getEntry(key);
+
+    // eenmalige migratie van oude key zonder channel
+    if (!prev) {
+      const old = getEntry(legacyKey(shop, p));
+      if (old && !old._migrated) {
+        setEntry(key, { ...old });
+        setEntry(legacyKey(shop, p), { ...old, _migrated: true });
+        prev = getEntry(key);
+      }
+    }
+
     const avail = productAvailable(p);
     const hash  = productHash(p);
 
@@ -310,14 +341,14 @@ async function handleShop(shop, channelId){
     if (shouldForceRefresh && prev?.messageId && !prev?.forceRefreshed) {
       try{
         const msg = await channel.messages.fetch(prev.messageId);
-        await msg.edit({ embeds:[buildEmbed(shop, p, 'refresh')], components: buildButtons(shop, p) });
+        await msg.edit({ embeds:[buildEmbed(shop, p, 'refresh')], components: buildButtons(shop, p, channelId) });
       }catch{}
       setEntry(key, { forceRefreshed: true });
     }
 
     if(!prev){
       if(avail){
-        const msg = await channel.send({ embeds:[buildEmbed(shop, p, 'nieuw')], components: buildButtons(shop, p) });
+        const msg = await channel.send({ embeds:[buildEmbed(shop, p, 'nieuw')], components: buildButtons(shop, p, channelId) });
         setEntry(key, { available:true, hash, messageId:msg.id, lastPostAt: Date.now() });
       }else{
         setEntry(key, { available:false, hash, messageId:null, lastPostAt: Date.now() });
@@ -328,37 +359,35 @@ async function handleShop(shop, channelId){
     if(prev.hash === hash) continue;  // geen echte wijziging
 
     if(prev.available === false && avail === true){
-      // RESTOCK: nieuwe post onderaan, oude post verwijderen, state bijwerken
-      const newMsg = await channel.send({ embeds:[buildEmbed(shop, p, 'restock')], components: buildButtons(shop, p) });
+      // RESTOCK, nieuwe post onderaan, oude post weg, state bijwerken
+      const newMsg = await channel.send({ embeds:[buildEmbed(shop, p, 'restock')], components: buildButtons(shop, p, channelId) });
       if(prev.messageId){
         try{
           const oldMsg = await channel.messages.fetch(prev.messageId);
-          await oldMsg.delete();
-        }catch{
-          // als verwijderen niet lukt, negeren
-        }
+          await oldMsg.delete(); // vereist Berichten beheren permissie
+        }catch{}
       }
       setEntry(key, { available:true, hash, messageId:newMsg.id, lastPostAt: Date.now() });
       continue;
     }
 
     if(prev.available === true && avail === false){
-      // SOLD OUT: zelfde bericht houden, strikethrough en knoppen laten staan
+      // SOLD OUT, zelfde post behouden, strikethrough en knoppen laten staan
       if(prev.messageId){
         try{
           const msg = await channel.messages.fetch(prev.messageId);
-          await msg.edit({ embeds:[buildEmbed(shop, p, 'sold out')], components: buildButtons(shop, p) });
+          await msg.edit({ embeds:[buildEmbed(shop, p, 'sold out')], components: buildButtons(shop, p, channelId) });
         }catch{}
       }
       setEntry(key, { available:false, hash, lastPostAt: Date.now() });
       continue;
     }
 
-    // Overige wijzigingen, bijvoorbeeld prijs
+    // overige updates, bijvoorbeeld prijs
     if(prev.messageId){
       try{
         const msg = await channel.messages.fetch(prev.messageId);
-        await msg.edit({ embeds:[buildEmbed(shop, p, 'update')], components: buildButtons(shop, p) });
+        await msg.edit({ embeds:[buildEmbed(shop, p, 'update')], components: buildButtons(shop, p, channelId) });
       }catch{}
     }
     setEntry(key, { hash, available: avail, lastPostAt: Date.now() });

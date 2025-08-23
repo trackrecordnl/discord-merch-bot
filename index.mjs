@@ -22,8 +22,6 @@ const CHECK_INTERVAL = Number(process.env.CHECK_INTERVAL || 60);
 const TZ = process.env.TIMEZONE || 'Europe/Amsterdam';
 const UA = process.env.HTTP_UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
 const FORCE_REFRESH_HOSTS = parseList(process.env.FORCE_REFRESH_HOSTS || '');
-const ALLOW_CART_X4_HOSTS = new Set(parseList(process.env.ALLOW_CART_X4_HOSTS || '').map(h => h.toLowerCase()));
-const ALLOW_CART_X4_CHANNELS = new Set(parseList(process.env.ALLOW_CART_X4_CHANNELS || ''));
 
 if(!TOKEN) throw new Error('DISCORD_TOKEN ontbreekt');
 if(SHOPS.length === 0 || SHOPS.length !== CHANNELS.length) throw new Error('SHOPS en CHANNELS moeten bestaan en even lang zijn');
@@ -264,9 +262,8 @@ function buildEmbed(shop, p, note){
   return embed;
 }
 
-function buildButtons(shop, p, channelId){
+function buildButtons(shop, p, _channelId){
   const base = originOnly(shop);
-  const host = hostOnly(shop).toLowerCase();
   const v = (p.variants||[]).find(x => x.available) || (p.variants||[])[0];
 
   if(!v){
@@ -275,19 +272,11 @@ function buildButtons(shop, p, channelId){
     ) ];
   }
 
-  const row = new ActionRowBuilder().addComponents(
+  return [ new ActionRowBuilder().addComponents(
     new ButtonBuilder().setLabel('Cart 1x').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:1`),
-    new ButtonBuilder().setLabel('Cart 2x').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:2`)
-  );
-
-  // 4x alleen in kanalen of hosts die jij toestaat
-  if (ALLOW_CART_X4_CHANNELS.has(String(channelId)) || ALLOW_CART_X4_HOSTS.has(host)) {
-    row.addComponents(
-      new ButtonBuilder().setLabel('Cart 4x').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:4`)
-    );
-  }
-
-  return [row];
+    new ButtonBuilder().setLabel('Cart 2x').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:2`),
+    new ButtonBuilder().setLabel('Cart 4x').setStyle(ButtonStyle.Link).setURL(`${base}/cart/${v.id}:4`)
+  ) ];
 }
 
 /* Loop */
@@ -324,7 +313,7 @@ async function handleShop(shop, channelId){
     const key = productKey(shop, p, channelId);
     let prev = getEntry(key);
 
-    // eenmalige migratie van oude key zonder channel
+    // migratie van oude key zonder channel
     if (!prev) {
       const old = getEntry(legacyKey(shop, p));
       if (old && !old._migrated) {
@@ -337,7 +326,7 @@ async function handleShop(shop, channelId){
     const avail = productAvailable(p);
     const hash  = productHash(p);
 
-    // éénmalig thumbnails forceren voor oude posts zonder foto
+    // éénmalig thumbnails forceren
     if (shouldForceRefresh && prev?.messageId && !prev?.forceRefreshed) {
       try{
         const msg = await channel.messages.fetch(prev.messageId);
@@ -356,15 +345,15 @@ async function handleShop(shop, channelId){
       continue;
     }
 
-    if(prev.hash === hash) continue;  // geen echte wijziging
+    if(prev.hash === hash) continue;
 
     if(prev.available === false && avail === true){
-      // RESTOCK, nieuwe post onderaan, oude post weg, state bijwerken
+      // restock, nieuw bericht onderaan, oude verwijderen
       const newMsg = await channel.send({ embeds:[buildEmbed(shop, p, 'restock')], components: buildButtons(shop, p, channelId) });
       if(prev.messageId){
         try{
           const oldMsg = await channel.messages.fetch(prev.messageId);
-          await oldMsg.delete(); // vereist Berichten beheren permissie
+          await oldMsg.delete(); // vereist Berichten beheren
         }catch{}
       }
       setEntry(key, { available:true, hash, messageId:newMsg.id, lastPostAt: Date.now() });
@@ -372,7 +361,7 @@ async function handleShop(shop, channelId){
     }
 
     if(prev.available === true && avail === false){
-      // SOLD OUT, zelfde post behouden, strikethrough en knoppen laten staan
+      // sold out, zelfde bericht houden, strikethrough en knoppen laten staan
       if(prev.messageId){
         try{
           const msg = await channel.messages.fetch(prev.messageId);
@@ -383,7 +372,7 @@ async function handleShop(shop, channelId){
       continue;
     }
 
-    // overige updates, bijvoorbeeld prijs
+    // overige updates
     if(prev.messageId){
       try{
         const msg = await channel.messages.fetch(prev.messageId);

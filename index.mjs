@@ -24,6 +24,7 @@ const TZ = process.env.TIMEZONE || 'Europe/Amsterdam';
 const CURRENCY = process.env.CURRENCY || 'EUR';
 const UA = process.env.HTTP_UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
 const FORCE_REFRESH_HOSTS = parseList(process.env.FORCE_REFRESH_HOSTS || '');
+const PASSWORD_COOLDOWN_SEC = Number(process.env.PASSWORD_COOLDOWN_SEC || 60);
 
 if(!TOKEN) throw new Error('DISCORD_TOKEN ontbreekt');
 if(SHOPS.length === 0 || SHOPS.length !== CHANNELS.length) throw new Error('SHOPS en CHANNELS moeten bestaan en even lang zijn');
@@ -81,7 +82,6 @@ function productHash(p){
   return arr.sort().join('|');
 }
 function snapshot(p){
-  // bewaar genoeg om later een nette "removed" kaart te kunnen tonen
   return {
     id: p.id, title: p.title, handle: p.handle,
     images: p.images, image: p.image, variants: p.variants,
@@ -286,7 +286,6 @@ function buildEmbed(shop, p, statusText, options = {}){
     .setURL(`${base}/products/${p.handle}`)
     .setColor(isRemoved ? 0x5865F2 : (available ? 0x57F287 : 0xED4245));
 
-  // hoofdvelden
   embed.addFields(
     { name:'Type', value: prettyType(p), inline: true },
     { name:'Status', value: statusText || (available ? 'available' : 'sold-out'), inline: true }
@@ -339,23 +338,49 @@ async function handleShop(shop, channelId){
 
   const origin = originOnly(shop);
 
-  // Password Protected alert op verandering
-  const pwKey = `pw|${origin}`;
-  const wasPw = getEntry(pwKey)?.protected || false;
+  /* Password status, één bericht dat wordt bijgewerkt */
+  const pwKey = `pw|${origin}|${channelId}`;
+  const prevPw = getEntry(pwKey) || { protected: null, messageId: null, lastAt: 0 };
   const nowPw = await isPasswordProtected(shop);
-  if (nowPw !== wasPw) {
+  const changed = prevPw.protected === null ? false : (nowPw !== prevPw.protected);
+
+  if (changed) {
     const embed = buildPasswordEmbed(shop, nowPw);
-    try{ await channel.send({ embeds:[embed] }); }catch{}
-    setEntry(pwKey, { protected: nowPw, lastAt: Date.now() });
+    try{
+      if (prevPw.messageId) {
+        const m = await channel.messages.fetch(prevPw.messageId).catch(()=>null);
+        if (m) await m.edit({ embeds:[embed] });
+        else {
+          const msg = await channel.send({ embeds:[embed] });
+          setEntry(pwKey, { protected: nowPw, messageId: msg.id, lastAt: Date.now() });
+          // ga verder met producten
+        }
+      } else {
+        const msg = await channel.send({ embeds:[embed] });
+        setEntry(pwKey, { protected: nowPw, messageId: msg.id, lastAt: Date.now() });
+      }
+    }catch{}
+    setEntry(pwKey, { ...prevPw, protected: nowPw, lastAt: Date.now() });
+  } else if (prevPw.protected === null) {
+    // eerste observatie, alleen state opslaan, niets posten
+    setEntry(pwKey, { ...prevPw, protected: nowPw, lastAt: Date.now() });
+  } else if (prevPw.messageId && (Date.now() - prevPw.lastAt) > PASSWORD_COOLDOWN_SEC * 1000) {
+    // optionele timestamp refresh zonder extra bericht
+    const embed = buildPasswordEmbed(shop, prevPw.protected);
+    try{
+      const m = await channel.messages.fetch(prevPw.messageId).catch(()=>null);
+      if (m) await m.edit({ embeds:[embed] });
+    }catch{}
+    setEntry(pwKey, { ...prevPw, lastAt: Date.now() });
   }
 
+  /* Producten ophalen en verwerken */
   const products = await fetchProducts(shop);
   products.sort((a,b)=> new Date(a.published_at||0) - new Date(b.published_at||0));
 
   const host = hostOnly(shop);
   const shouldForceRefresh = FORCE_REFRESH_HOSTS.includes(host);
 
-  // verzamel handles van deze run
   const currentHandles = new Set();
 
   for(const p of products){
@@ -365,7 +390,6 @@ async function handleShop(shop, channelId){
     const key = productKey(shop, p, channelId);
     let prev = getEntry(key);
 
-    // migratie van oude key zonder channel
     if (!prev) {
       const old = getEntry(legacyKey(shop, p));
       if (old && !old._migrated) {
@@ -378,7 +402,6 @@ async function handleShop(shop, channelId){
     const avail = productAvailable(p);
     const hash  = productHash(p);
 
-    // éénmalig thumbnails forceren
     if (shouldForceRefresh && prev?.messageId && !prev?.forceRefreshed) {
       try{
         const msg = await channel.messages.fetch(prev.messageId);
@@ -387,7 +410,6 @@ async function handleShop(shop, channelId){
       setEntry(key, { ...prev, forceRefreshed: true });
     }
 
-    // NIEUW
     if(!prev){
       if(avail){
         const msg = await channel.send({ embeds:[buildEmbed(shop, p, 'new')], components: buildButtons(shop, p) });
@@ -398,27 +420,23 @@ async function handleShop(shop, channelId){
       continue;
     }
 
-    // GEEN WIJZIGING
     if(prev.hash === hash){
-      // refresh snapshot voor betere 'removed' later
       setEntry(key, { ...prev, last: snapshot(p) });
       continue;
     }
 
-    // RESTOCK
     if(prev.available === false && avail === true){
       const newMsg = await channel.send({ embeds:[buildEmbed(shop, p, 'restock')], components: buildButtons(shop, p) });
       if(prev.messageId){
         try{
           const oldMsg = await channel.messages.fetch(prev.messageId);
-          await oldMsg.delete(); // vereist Berichten beheren
+          await oldMsg.delete();
         }catch{}
       }
       setEntry(key, { available:true, removed:false, hash, messageId:newMsg.id, lastPostAt: Date.now(), last: snapshot(p) });
       continue;
     }
 
-    // SOLD OUT
     if(prev.available === true && avail === false){
       if(prev.messageId){
         try{
@@ -430,7 +448,6 @@ async function handleShop(shop, channelId){
       continue;
     }
 
-    // OVERIGE UPDATE, bijv. prijs
     if(prev.messageId){
       try{
         const msg = await channel.messages.fetch(prev.messageId);
@@ -440,7 +457,7 @@ async function handleShop(shop, channelId){
     setEntry(key, { ...prev, hash, available: avail, removed:false, lastPostAt: Date.now(), last: snapshot(p) });
   }
 
-  // Index updaten en REMOVED detecteren
+  // Removed detectie via index
   const indexKey = `index|${origin}|${channelId}`;
   const oldHandles = new Set(getEntry(indexKey)?.handles || []);
   const removedHandles = [...oldHandles].filter(h => !currentHandles.has(h));
@@ -453,13 +470,11 @@ async function handleShop(shop, channelId){
     const p = prev.last || { title: h, handle: h, variants: [], product_type: '', images: [], image: null, published_at: null };
     const statusText = (prev.available === false) ? '~~sold-out~~ → removed' : 'removed';
 
-    // bewerk oud bericht als die er is, anders post nieuw
     if(prev.messageId){
       try{
         const msg = await channel.messages.fetch(prev.messageId);
         await msg.edit({ embeds:[buildEmbed(shop, p, statusText)], components: buildButtons(shop, p) });
       }catch{
-        // plaats nieuw als edit faalt
         try{ await channel.send({ embeds:[buildEmbed(shop, p, statusText)], components: buildButtons(shop, p) }); }catch{}
       }
     }else{
@@ -469,6 +484,5 @@ async function handleShop(shop, channelId){
     setEntry(key, { ...prev, available:false, removed:true, hash:'removed', lastPostAt: Date.now(), last: p });
   }
 
-  // bewaar de nieuwe index
   setEntry(indexKey, { handles: Array.from(currentHandles), at: Date.now() });
 }

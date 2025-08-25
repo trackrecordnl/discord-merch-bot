@@ -19,7 +19,9 @@ const SHOPS = parseList(process.env.SHOPS);
 const CHANNELS = parseList(process.env.CHANNELS);
 const KEYWORDS = parseList(process.env.KEYWORDS || 'vinyl,lp,cd,compact disc,schallplatte');
 const CHECK_INTERVAL = Number(process.env.CHECK_INTERVAL || 60);
+const LOCALE = process.env.LOCALE || 'en-GB';
 const TZ = process.env.TIMEZONE || 'Europe/Amsterdam';
+const CURRENCY = process.env.CURRENCY || 'EUR';
 const UA = process.env.HTTP_UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
 const FORCE_REFRESH_HOSTS = parseList(process.env.FORCE_REFRESH_HOSTS || '');
 
@@ -48,7 +50,7 @@ function originOnly(url){
 function hostOnly(url){
   try{ return new URL(url).hostname; } catch { const m = url.match(/^https?:\/\/([^/]+)/); return m?m[1]:url; }
 }
-function nlDate(d){ return new Intl.DateTimeFormat('nl-NL',{ dateStyle:'long', timeStyle:'short', timeZone: TZ }).format(d); }
+function fmtDate(d){ return new Intl.DateTimeFormat(LOCALE,{ dateStyle:'long', timeStyle:'short', timeZone: TZ }).format(d); }
 function asPriceString(val){
   if(val == null) return '';
   const s = String(val);
@@ -78,6 +80,14 @@ function productHash(p){
   const arr = (p.variants||[]).map(v => `${v.id}:${v.available?1:0}:${asPriceString(v.price)}`);
   return arr.sort().join('|');
 }
+function snapshot(p){
+  // bewaar genoeg om later een nette "removed" kaart te kunnen tonen
+  return {
+    id: p.id, title: p.title, handle: p.handle,
+    images: p.images, image: p.image, variants: p.variants,
+    product_type: p.product_type, published_at: p.published_at
+  };
+}
 
 /* Password Protected detectie */
 async function isPasswordProtected(base){
@@ -96,7 +106,7 @@ function buildPasswordEmbed(shop, locked){
     .setTitle(title)
     .setURL(base)
     .setColor(color)
-    .addFields({ name: locked ? 'Locked At' : 'Unlocked At', value: nlDate(new Date()), inline: true });
+    .addFields({ name: locked ? 'Locked At' : 'Unlocked At', value: fmtDate(new Date()), inline: true });
 }
 
 /* Fetch met meerdere fallbacks */
@@ -247,22 +257,58 @@ function normalizeProductJs(pjs){
 }
 
 /* Discord UI */
-function buildEmbed(shop, p, note){
+function prettyType(p){
+  const t = (p?.product_type || '').trim();
+  if (t) return t;
+  const title = (p?.title || '').toLowerCase();
+  if (title.includes('vinyl') || title.includes('lp')) return 'Vinyl LP';
+  if (title.includes('cd')) return 'CD';
+  return 'Merch';
+}
+function minPrice(p){
+  const nums = (p?.variants||[])
+    .map(v => Number(asPriceString(v.price)))
+    .filter(n => !Number.isNaN(n));
+  if (!nums.length) return '';
+  return `${nums.sort((a,b)=>a-b)[0].toFixed(2)} ${CURRENCY}`;
+}
+function buildEmbed(shop, p, statusText, options = {}){
   const base = originOnly(shop);
   const available = productAvailable(p);
-  const title = available ? p.title : `~~${p.title}~~ (Sold Out)`;
+  const isRemoved = statusText && /removed/i.test(statusText);
+
+  const title = (!isRemoved && !available)
+    ? `~~${p.title}~~ (Sold Out)`
+    : p.title;
+
   const embed = new EmbedBuilder()
     .setTitle(title)
     .setURL(`${base}/products/${p.handle}`)
-    .setColor(available ? 0x57F287 : 0xED4245)
-    .addFields({ name:'Updated', value: nlDate(new Date()), inline: true });
+    .setColor(isRemoved ? 0x5865F2 : (available ? 0x57F287 : 0xED4245));
+
+  // hoofdvelden
+  embed.addFields(
+    { name:'Type', value: prettyType(p), inline: true },
+    { name:'Status', value: statusText || (available ? 'available' : 'sold-out'), inline: true }
+  );
+
+  const price = minPrice(p);
+  if (price) embed.addFields({ name: 'Price', value: price, inline: false });
+
+  embed.addFields({ name:'Updated', value: fmtDate(new Date()), inline: false });
+
+  if (p?.published_at) {
+    const pub = new Date(p.published_at);
+    if (!isNaN(pub)) embed.addFields({ name:'Published', value: fmtDate(pub), inline: false });
+  }
+
   const img = pickImageUrl(shop, p);
   if(img) embed.setThumbnail(img);
-  if(note) embed.addFields({ name:'Status', value: note, inline: true });
+
   return embed;
 }
 
-function buildButtons(shop, p, _channelId){
+function buildButtons(shop, p){
   const base = originOnly(shop);
   const v = (p.variants||[]).find(x => x.available) || (p.variants||[])[0];
 
@@ -288,11 +334,13 @@ async function runOnce(){
 }
 
 async function handleShop(shop, channelId){
-  const channel = await client.channels.fetch(channelId);
+  const channel = await client.channels.fetch(channelId).catch(()=>null);
   if(!channel) return;
 
+  const origin = originOnly(shop);
+
   // Password Protected alert op verandering
-  const pwKey = `pw|${originOnly(shop)}`;
+  const pwKey = `pw|${origin}`;
   const wasPw = getEntry(pwKey)?.protected || false;
   const nowPw = await isPasswordProtected(shop);
   if (nowPw !== wasPw) {
@@ -307,8 +355,12 @@ async function handleShop(shop, channelId){
   const host = hostOnly(shop);
   const shouldForceRefresh = FORCE_REFRESH_HOSTS.includes(host);
 
+  // verzamel handles van deze run
+  const currentHandles = new Set();
+
   for(const p of products){
     if(!productWanted(p)) continue;
+    currentHandles.add(p.handle);
 
     const key = productKey(shop, p, channelId);
     let prev = getEntry(key);
@@ -330,55 +382,93 @@ async function handleShop(shop, channelId){
     if (shouldForceRefresh && prev?.messageId && !prev?.forceRefreshed) {
       try{
         const msg = await channel.messages.fetch(prev.messageId);
-        await msg.edit({ embeds:[buildEmbed(shop, p, 'refresh')], components: buildButtons(shop, p, channelId) });
+        await msg.edit({ embeds:[buildEmbed(shop, p, 'refresh')], components: buildButtons(shop, p) });
       }catch{}
-      setEntry(key, { forceRefreshed: true });
+      setEntry(key, { ...prev, forceRefreshed: true });
     }
 
+    // NIEUW
     if(!prev){
       if(avail){
-        const msg = await channel.send({ embeds:[buildEmbed(shop, p, 'nieuw')], components: buildButtons(shop, p, channelId) });
-        setEntry(key, { available:true, hash, messageId:msg.id, lastPostAt: Date.now() });
+        const msg = await channel.send({ embeds:[buildEmbed(shop, p, 'new')], components: buildButtons(shop, p) });
+        setEntry(key, { available:true, removed:false, hash, messageId:msg.id, lastPostAt: Date.now(), last: snapshot(p) });
       }else{
-        setEntry(key, { available:false, hash, messageId:null, lastPostAt: Date.now() });
+        setEntry(key, { available:false, removed:false, hash, messageId:null, lastPostAt: Date.now(), last: snapshot(p) });
       }
       continue;
     }
 
-    if(prev.hash === hash) continue;
+    // GEEN WIJZIGING
+    if(prev.hash === hash){
+      // refresh snapshot voor betere 'removed' later
+      setEntry(key, { ...prev, last: snapshot(p) });
+      continue;
+    }
 
+    // RESTOCK
     if(prev.available === false && avail === true){
-      // restock, nieuw bericht onderaan, oude verwijderen
-      const newMsg = await channel.send({ embeds:[buildEmbed(shop, p, 'restock')], components: buildButtons(shop, p, channelId) });
+      const newMsg = await channel.send({ embeds:[buildEmbed(shop, p, 'restock')], components: buildButtons(shop, p) });
       if(prev.messageId){
         try{
           const oldMsg = await channel.messages.fetch(prev.messageId);
           await oldMsg.delete(); // vereist Berichten beheren
         }catch{}
       }
-      setEntry(key, { available:true, hash, messageId:newMsg.id, lastPostAt: Date.now() });
+      setEntry(key, { available:true, removed:false, hash, messageId:newMsg.id, lastPostAt: Date.now(), last: snapshot(p) });
       continue;
     }
 
+    // SOLD OUT
     if(prev.available === true && avail === false){
-      // sold out, zelfde bericht houden, strikethrough en knoppen laten staan
       if(prev.messageId){
         try{
           const msg = await channel.messages.fetch(prev.messageId);
-          await msg.edit({ embeds:[buildEmbed(shop, p, 'sold out')], components: buildButtons(shop, p, channelId) });
+          await msg.edit({ embeds:[buildEmbed(shop, p, 'sold-out')], components: buildButtons(shop, p) });
         }catch{}
       }
-      setEntry(key, { available:false, hash, lastPostAt: Date.now() });
+      setEntry(key, { ...prev, available:false, removed:false, hash, lastPostAt: Date.now(), last: snapshot(p) });
       continue;
     }
 
-    // overige updates
+    // OVERIGE UPDATE, bijv. prijs
     if(prev.messageId){
       try{
         const msg = await channel.messages.fetch(prev.messageId);
-        await msg.edit({ embeds:[buildEmbed(shop, p, 'update')], components: buildButtons(shop, p, channelId) });
+        await msg.edit({ embeds:[buildEmbed(shop, p, 'update')], components: buildButtons(shop, p) });
       }catch{}
     }
-    setEntry(key, { hash, available: avail, lastPostAt: Date.now() });
+    setEntry(key, { ...prev, hash, available: avail, removed:false, lastPostAt: Date.now(), last: snapshot(p) });
   }
+
+  // Index updaten en REMOVED detecteren
+  const indexKey = `index|${origin}|${channelId}`;
+  const oldHandles = new Set(getEntry(indexKey)?.handles || []);
+  const removedHandles = [...oldHandles].filter(h => !currentHandles.has(h));
+
+  for(const h of removedHandles){
+    const key = `${origin}|${h}|${channelId}`;
+    const prev = getEntry(key);
+    if(!prev || prev.removed) continue;
+
+    const p = prev.last || { title: h, handle: h, variants: [], product_type: '', images: [], image: null, published_at: null };
+    const statusText = (prev.available === false) ? '~~sold-out~~ → removed' : 'removed';
+
+    // bewerk oud bericht als die er is, anders post nieuw
+    if(prev.messageId){
+      try{
+        const msg = await channel.messages.fetch(prev.messageId);
+        await msg.edit({ embeds:[buildEmbed(shop, p, statusText)], components: buildButtons(shop, p) });
+      }catch{
+        // plaats nieuw als edit faalt
+        try{ await channel.send({ embeds:[buildEmbed(shop, p, statusText)], components: buildButtons(shop, p) }); }catch{}
+      }
+    }else{
+      try{ await channel.send({ embeds:[buildEmbed(shop, p, statusText)], components: buildButtons(shop, p) }); }catch{}
+    }
+
+    setEntry(key, { ...prev, available:false, removed:true, hash:'removed', lastPostAt: Date.now(), last: p });
+  }
+
+  // bewaar de nieuwe index
+  setEntry(indexKey, { handles: Array.from(currentHandles), at: Date.now() });
 }

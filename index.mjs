@@ -58,6 +58,9 @@ function asPriceString(val){
   if(/^\d+$/.test(s)) return (parseInt(s,10)/100).toFixed(2);
   const n = Number(s); return Number.isNaN(n) ? s : n.toFixed(2);
 }
+function normHandle(h){
+  try{ return decodeURIComponent(String(h||'')).toLowerCase(); }catch{ return String(h||'').toLowerCase(); }
+}
 function pickImageUrl(shop, p){
   let u = p?.image?.src || (Array.isArray(p?.images) && p.images[0]?.src) || null;
   if (!u) return null;
@@ -75,15 +78,15 @@ function productWanted(p){
   return textMatchesKeywords(p?.title, p?.product_type, tags);
 }
 function productAvailable(p){ return Array.isArray(p?.variants) && p.variants.some(v => v?.available); }
-function legacyKey(shop, p){ return `${originOnly(shop)}|${p.handle||p.id}`; }
-function productKey(shop, p, channelId){ return `${originOnly(shop)}|${p.handle||p.id}|${channelId}`; }
+function legacyKey(shop, p){ return `${originOnly(shop)}|${normHandle(p.handle||p.id)}`; }
+function productKey(shop, p, channelId){ return `${originOnly(shop)}|${normHandle(p.handle||p.id)}|${channelId}`; }
 function productHash(p){
   const arr = (p.variants||[]).map(v => `${v.id}:${v.available?1:0}:${asPriceString(v.price)}`);
   return arr.sort().join('|');
 }
 function snapshot(p){
   return {
-    id: p.id, title: p.title, handle: p.handle,
+    id: p.id, title: p.title, handle: normHandle(p.handle),
     images: p.images, image: p.image, variants: p.variants,
     product_type: p.product_type, published_at: p.published_at
   };
@@ -154,7 +157,7 @@ async function fetchProductsViaSitemap(base){
         const urls = Array.from(x.matchAll(/<loc>([^<]+)<\/loc>/g)).map(m=>m[1]).filter(u => /\/products\//.test(u));
         for(const u of urls){
           const mh = u.match(/\/products\/([^/?#]+)/);
-          if(mh && mh[1]) handles.add(mh[1]);
+          if(mh && mh[1]) handles.add(normHandle(mh[1]));
         }
       }catch{}
     }
@@ -165,7 +168,7 @@ async function fetchProductsViaSitemap(base){
       const direct = Array.from(xml.matchAll(/<loc>([^<]+)<\/loc>/g)).map(m=>m[1]).filter(u => /\/products\//.test(u));
       for(const u of direct){
         const mh = u.match(/\/products\/([^/?#]+)/);
-        if(mh && mh[1]) handles.add(mh[1]);
+        if(mh && mh[1]) handles.add(normHandle(mh[1]));
       }
       for(const guess of [`${base}/sitemap_products_1.xml`, `${base}/sitemap_products_2.xml`]){
         await harvestMap(guess);
@@ -189,8 +192,8 @@ async function fetchProductsViaSearch(base){
         const link = p?.url || p?.handle || p?.url_handle;
         if(!link) continue;
         const m = String(link).match(/\/products\/([^/?#]+)/);
-        if(m && m[1]) handles.add(m[1]);
-        else if (typeof link === 'string' && !link.includes('/')) handles.add(link);
+        if(m && m[1]) handles.add(normHandle(m[1]));
+        else if (typeof link === 'string' && !link.includes('/')) handles.add(normHandle(link));
       }
     }catch{}
   }
@@ -220,7 +223,7 @@ function extractHandlesFromHtml(html){
   for(const m of html.matchAll(/href="([^"]*\/products\/[^"]+)"/g)){
     const u = m[1];
     const mh = u.match(/\/products\/([^/?#]+)/);
-    if(mh && mh[1]) set.add(mh[1]);
+    if(mh && mh[1]) set.add(normHandle(mh[1]));
   }
   return Array.from(set);
 }
@@ -246,7 +249,7 @@ function normalizeProductJs(pjs){
   return {
     id: pjs?.id ?? pjs?.product_id ?? String(pjs?.handle || Math.random()),
     title: pjs?.title || 'Product',
-    handle: pjs?.handle,
+    handle: normHandle(pjs?.handle || pjs?.url_handle || pjs?.handle_id),
     images,
     image: images[0] || null,
     published_at: pjs?.published_at || null,
@@ -272,7 +275,7 @@ function minPrice(p){
   if (!nums.length) return '';
   return `${nums.sort((a,b)=>a-b)[0].toFixed(2)} ${CURRENCY}`;
 }
-function buildEmbed(shop, p, statusText, options = {}){
+function buildEmbed(shop, p, statusText){
   const base = originOnly(shop);
   const available = productAvailable(p);
   const isRemoved = statusText && /removed/i.test(statusText);
@@ -349,23 +352,21 @@ async function handleShop(shop, channelId){
     try{
       if (prevPw.messageId) {
         const m = await channel.messages.fetch(prevPw.messageId).catch(()=>null);
-        if (m) await m.edit({ embeds:[embed] });
-        else {
+        if (m) {
+          await m.edit({ embeds:[embed] });
+          setEntry(pwKey, { ...prevPw, protected: nowPw, lastAt: Date.now() });
+        } else {
           const msg = await channel.send({ embeds:[embed] });
           setEntry(pwKey, { protected: nowPw, messageId: msg.id, lastAt: Date.now() });
-          // ga verder met producten
         }
       } else {
         const msg = await channel.send({ embeds:[embed] });
         setEntry(pwKey, { protected: nowPw, messageId: msg.id, lastAt: Date.now() });
       }
     }catch{}
-    setEntry(pwKey, { ...prevPw, protected: nowPw, lastAt: Date.now() });
   } else if (prevPw.protected === null) {
-    // eerste observatie, alleen state opslaan, niets posten
     setEntry(pwKey, { ...prevPw, protected: nowPw, lastAt: Date.now() });
   } else if (prevPw.messageId && (Date.now() - prevPw.lastAt) > PASSWORD_COOLDOWN_SEC * 1000) {
-    // optionele timestamp refresh zonder extra bericht
     const embed = buildPasswordEmbed(shop, prevPw.protected);
     try{
       const m = await channel.messages.fetch(prevPw.messageId).catch(()=>null);
@@ -383,7 +384,8 @@ async function handleShop(shop, channelId){
 
   const currentHandles = new Set();
 
-  for(const p of products){
+  for(const p0 of products){
+    const p = { ...p0, handle: normHandle(p0.handle) };
     if(!productWanted(p)) continue;
     currentHandles.add(p.handle);
 
@@ -438,23 +440,31 @@ async function handleShop(shop, channelId){
     }
 
     if(prev.available === true && avail === false){
-      if(prev.messageId){
-        try{
+      let newId = prev.messageId || null;
+      try{
+        if(prev.messageId){
           const msg = await channel.messages.fetch(prev.messageId);
           await msg.edit({ embeds:[buildEmbed(shop, p, 'sold-out')], components: buildButtons(shop, p) });
-        }catch{}
-      }
-      setEntry(key, { ...prev, available:false, removed:false, hash, lastPostAt: Date.now(), last: snapshot(p) });
+        }else{
+          const m2 = await channel.send({ embeds:[buildEmbed(shop, p, 'sold-out')], components: buildButtons(shop, p) });
+          newId = m2.id;
+        }
+      }catch{}
+      setEntry(key, { ...prev, available:false, removed:false, hash, messageId:newId, lastPostAt: Date.now(), last: snapshot(p) });
       continue;
     }
 
-    if(prev.messageId){
-      try{
+    let newId = prev.messageId || null;
+    try{
+      if(prev.messageId){
         const msg = await channel.messages.fetch(prev.messageId);
         await msg.edit({ embeds:[buildEmbed(shop, p, 'update')], components: buildButtons(shop, p) });
-      }catch{}
-    }
-    setEntry(key, { ...prev, hash, available: avail, removed:false, lastPostAt: Date.now(), last: snapshot(p) });
+      }else{
+        const m2 = await channel.send({ embeds:[buildEmbed(shop, p, 'update')], components: buildButtons(shop, p) });
+        newId = m2.id;
+      }
+    }catch{}
+    setEntry(key, { ...prev, hash, available: avail, removed:false, messageId:newId, lastPostAt: Date.now(), last: snapshot(p) });
   }
 
   // Removed detectie via index
@@ -462,26 +472,33 @@ async function handleShop(shop, channelId){
   const oldHandles = new Set(getEntry(indexKey)?.handles || []);
   const removedHandles = [...oldHandles].filter(h => !currentHandles.has(h));
 
-  for(const h of removedHandles){
+  for(const h0 of removedHandles){
+    const h = normHandle(h0);
     const key = `${origin}|${h}|${channelId}`;
     const prev = getEntry(key);
-    if(!prev || prev.removed) continue;
+    if(prev && prev.removed) continue; // al afgehandeld
 
-    const p = prev.last || { title: h, handle: h, variants: [], product_type: '', images: [], image: null, published_at: null };
-    const statusText = (prev.available === false) ? '~~sold-out~~ → removed' : 'removed';
+    const p = (prev?.last) || { title: h, handle: h, variants: [], product_type: '', images: [], image: null, published_at: null };
+    const statusText = (prev && prev.available === false) ? '~~sold-out~~ → removed' : 'removed';
 
-    if(prev.messageId){
-      try{
-        const msg = await channel.messages.fetch(prev.messageId);
-        await msg.edit({ embeds:[buildEmbed(shop, p, statusText)], components: buildButtons(shop, p) });
-      }catch{
-        try{ await channel.send({ embeds:[buildEmbed(shop, p, statusText)], components: buildButtons(shop, p) }); }catch{}
+    let newId = prev?.messageId || null;
+    try{
+      if(prev?.messageId){
+        const msg = await channel.messages.fetch(prev.messageId).catch(()=>null);
+        if (msg) {
+          await msg.edit({ embeds:[buildEmbed(shop, p, statusText)], components: buildButtons(shop, p) });
+          newId = msg.id;
+        } else {
+          const m2 = await channel.send({ embeds:[buildEmbed(shop, p, statusText)], components: buildButtons(shop, p) });
+          newId = m2.id;
+        }
+      }else{
+        const m2 = await channel.send({ embeds:[buildEmbed(shop, p, statusText)], components: buildButtons(shop, p) });
+        newId = m2.id;
       }
-    }else{
-      try{ await channel.send({ embeds:[buildEmbed(shop, p, statusText)], components: buildButtons(shop, p) }); }catch{}
-    }
+    }catch{}
 
-    setEntry(key, { ...prev, available:false, removed:true, hash:'removed', lastPostAt: Date.now(), last: p });
+    setEntry(key, { ...(prev||{}), available:false, removed:true, hash:'removed', messageId:newId, lastPostAt: Date.now(), last: p });
   }
 
   setEntry(indexKey, { handles: Array.from(currentHandles), at: Date.now() });
